@@ -136,7 +136,11 @@ impl RuleSet {
         // Badfilter applies across lists, so it can only run once every list is read.
         // A user badfilter (list 0) cancels any twin; a list's badfilter cancels list rules only.
         let twins = |from_user: bool| -> HashSet<String> {
-            rules.iter().filter(|(id, r)| r.badfilter && (*id == 0) == from_user).map(|(_, r)| badfilter_twin(&r.text)).collect()
+            rules
+                .iter()
+                .filter(|(id, r)| r.badfilter && (*id == 0) == from_user)
+                .map(|(_, r)| badfilter_twin(&r.text))
+                .collect()
         };
         let (by_user, by_lists) = (twins(true), twins(false));
         let mut set = RuleSet::default();
