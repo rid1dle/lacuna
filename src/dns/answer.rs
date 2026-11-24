@@ -79,7 +79,9 @@ pub fn servfail(query: &Message) -> Message {
 
 /// For a packet too broken to parse: all we know is the id.
 pub fn formerr(id: u16) -> Message {
-    Message::error_msg(id, OpCode::Query, ResponseCode::FormErr)
+    let mut resp = Message::error_msg(id, OpCode::Query, ResponseCode::FormErr);
+    resp.metadata.recursion_available = true;
+    resp
 }
 
 /// The rewrite address for `name`: an exact rule wins, then the nearest `*.suffix` rule.
@@ -141,6 +143,7 @@ mod tests {
         assert!(r.metadata.recursion_available);
         assert_eq!(r.metadata.recursion_desired, q.metadata.recursion_desired);
         assert_eq!(r.metadata.response_code, code);
+        assert!(!r.metadata.authoritative);
     }
 
     #[test]
@@ -173,7 +176,9 @@ mod tests {
         let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
         let qa = query("h.example.", RecordType::A, false);
         let qaaaa = query("h.example.", RecordType::AAAA, false);
-        assert_eq!(hosts_ip(&qa, v4, 5).answers.len(), 1);
+        let r = hosts_ip(&qa, v4, 5);
+        assert_eq!(r.answers.len(), 1);
+        assert_eq!(r.answers[0].ttl, 5);
         assert!(hosts_ip(&qaaaa, v4, 5).answers.is_empty());
         assert_eq!(hosts_ip(&qaaaa, v6, 5).answers.len(), 1);
         let r = hosts_ip(&qa, v6, 5);
@@ -205,6 +210,7 @@ mod tests {
         assert_eq!(f.metadata.id, 7);
         assert_eq!(f.metadata.response_code, ResponseCode::FormErr);
         assert_eq!(f.metadata.message_type, MessageType::Response);
+        assert!(f.metadata.recursion_available);
     }
 
     #[test]
@@ -230,6 +236,16 @@ mod tests {
         }
         let q = query("x.example.", RecordType::A, false);
         assert!(wire(&blocked(&q, 1)).edns.is_none());
+    }
+
+    #[test]
+    fn query_name_case_is_preserved() {
+        let q = query("AdS.Example.com.", RecordType::A, false);
+        for r in [blocked(&q, 1), rewrite(&q, Ipv4Addr::LOCALHOST, 1)] {
+            let r = wire(&r);
+            assert_eq!(r.queries[0].name().to_ascii(), "AdS.Example.com.");
+            assert_eq!(r.answers[0].name.to_ascii(), "AdS.Example.com.");
+        }
     }
 
     fn rw(name: &str, last: u8) -> Rewrite {
