@@ -1,7 +1,7 @@
-//! Filter-list rules: parsing one line (this task) and matching names (next).
+//! Filter-list rules: parsing one line, then matching names against a built set.
 
+mod engine;
 mod parse;
 
-// Consumed by the rule engine in the next task.
-#[allow(unused_imports)]
+pub use engine::{ListStats, RuleSet, Verdict};
 pub use parse::{parse_line, Parsed, Rule, RuleKind, SkipReason};

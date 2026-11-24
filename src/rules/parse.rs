@@ -40,12 +40,26 @@ pub enum SkipReason {
     Invalid,
 }
 
+/// AdGuard/uBO modifiers worth counting by name.
+const KNOWN_MODIFIERS: [&str; 13] = [
+    "client", "dnstype", "denyallow", "dnsrewrite", "ctag", "third-party", "domain", "script",
+    "image", "popup", "document", "all", "match-case",
+];
+
 impl SkipReason {
     /// Stable key for skip counters.
     pub fn label(&self) -> String {
         match self {
             SkipReason::Regex => "regex".into(),
-            SkipReason::Modifier(name) => format!("modifier:{name}"),
+            SkipReason::Modifier(name) => {
+                // Names come from list text, so only known ones may become a counter key.
+                let lower = name.to_ascii_lowercase();
+                if KNOWN_MODIFIERS.contains(&lower.as_str()) {
+                    format!("modifier:{lower}")
+                } else {
+                    "modifier:other".into()
+                }
+            }
             SkipReason::Wildcard => "wildcard".into(),
             SkipReason::UrlPath => "url_path".into(),
             SkipReason::Invalid => "invalid".into(),
@@ -80,10 +94,19 @@ pub fn parse_line(line: &str) -> Parsed {
         return Parsed::Skip(SkipReason::Regex);
     }
 
-    let (pattern, modifiers) = match rest.rsplit_once('$') {
+    // Classify by the part before the first `$`: a `$` can sit inside a URL query or a regex.
+    let (pattern, modifiers) = match rest.split_once('$') {
         Some((pattern, mods)) => (pattern, Some(mods)),
         None => (rest, None),
     };
+    if pattern.len() > 1 && pattern.starts_with('/') && pattern.ends_with('/') {
+        return Parsed::Skip(SkipReason::Regex);
+    }
+    let bare = pattern.strip_prefix("||").unwrap_or(pattern);
+    let bare = bare.strip_suffix('^').unwrap_or(bare);
+    if bare.contains('/') {
+        return Parsed::Skip(SkipReason::UrlPath);
+    }
 
     let (mut important, mut badfilter) = (false, false);
     if let Some(mods) = modifiers {
@@ -99,11 +122,7 @@ pub fn parse_line(line: &str) -> Parsed {
         }
     }
 
-    let pattern = pattern.strip_prefix("||").unwrap_or(pattern);
-    let pattern = pattern.strip_suffix('^').unwrap_or(pattern);
-    if pattern.contains('/') {
-        return Parsed::Skip(SkipReason::UrlPath);
-    }
+    let pattern = bare;
     if pattern.contains('*') {
         return Parsed::Skip(SkipReason::Wildcard);
     }
@@ -124,11 +143,16 @@ fn parse_hosts(text: &str) -> Parsed {
     // Hosts files allow a trailing "# comment".
     let body = text.split('#').next().unwrap_or(text);
     let mut tokens = body.split_whitespace();
-    let (Some(addr), Some(name), None) = (tokens.next(), tokens.next(), tokens.next()) else {
+    let (Some(addr), Some(name)) = (tokens.next(), tokens.next()) else {
         return Parsed::Skip(SkipReason::Invalid);
     };
-    if is_hosts_boilerplate(&name.to_ascii_lowercase()) {
+    let extra: Vec<&str> = tokens.collect();
+    // A line naming only the machine itself (`127.0.0.1 localhost localhost.localdomain`) is boilerplate.
+    if std::iter::once(name).chain(extra.iter().copied()).all(|n| is_hosts_boilerplate(&n.to_ascii_lowercase())) {
         return Parsed::Blank;
+    }
+    if !extra.is_empty() {
+        return Parsed::Skip(SkipReason::Invalid);
     }
     let (Ok(ip), Some(domain)) = (addr.parse::<IpAddr>(), normalize_domain(name)) else {
         return Parsed::Skip(SkipReason::Invalid);
@@ -275,6 +299,27 @@ mod tests {
         }
         assert!(matches!(parse_line("||xn--bcher-kva.de^"), Parsed::Rule(_)));
         assert!(matches!(parse_line("||a_b.c-d.com^"), Parsed::Rule(_)));
+    }
+
+    #[test]
+    fn classification_order_url_and_regex_before_modifiers() {
+        assert_eq!(skip("||example.com/p?a=$b"), SkipReason::UrlPath);
+        assert_eq!(skip("/re/$important"), SkipReason::Regex);
+        assert_eq!(skip("@@/ads[0-9]+/$important"), SkipReason::Regex);
+    }
+
+    #[test]
+    fn multi_name_boilerplate_hosts_lines_are_blank() {
+        assert_eq!(parse_line("127.0.0.1 localhost localhost.localdomain"), Parsed::Blank);
+        assert_eq!(parse_line("::1 localhost ip6-localhost ip6-loopback"), Parsed::Blank);
+        assert_eq!(skip("0.0.0.0 localhost a.com"), SkipReason::Invalid);
+    }
+
+    #[test]
+    fn modifier_labels_are_bounded() {
+        assert_eq!(SkipReason::Modifier("DNSTYPE".into()).label(), "modifier:dnstype");
+        assert_eq!(SkipReason::Modifier("third-party".into()).label(), "modifier:third-party");
+        assert_eq!(SkipReason::Modifier("random-list-text".into()).label(), "modifier:other");
     }
 
     #[test]
