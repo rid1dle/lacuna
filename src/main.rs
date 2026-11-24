@@ -3,6 +3,7 @@
 
 mod codes;
 mod config;
+mod rules;
 
 use std::path::Path;
 use std::process::ExitCode;
