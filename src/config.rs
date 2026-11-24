@@ -116,6 +116,10 @@ impl Config {
             !self.upstreams.doh.is_empty() || !self.upstreams.fallback.is_empty(),
             "upstreams needs at least one doh or fallback server"
         );
+        ensure!(
+            self.upstreams.race_timeout_ms > 0,
+            "upstreams.race_timeout_ms must be above 0"
+        );
         for d in &self.upstreams.doh {
             ensure!(
                 d.url.starts_with("https://"),
@@ -175,6 +179,13 @@ mod tests {
         let text = DEPLOY.replace("\"*.home.riddlelab.dev\"", "\"a.*.b\"");
         let err = Config::parse(&text).unwrap_err().to_string();
         assert!(err.contains("a.*.b"), "{err}");
+    }
+
+    #[test]
+    fn rejects_zero_race_timeout() {
+        let text = DEPLOY.replace("race_timeout_ms = 1000", "race_timeout_ms = 0");
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("race_timeout_ms"), "{err}");
     }
 
     #[test]

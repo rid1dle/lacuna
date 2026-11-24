@@ -7,8 +7,16 @@ edition = "2021"
 anyhow = { version = "=1.0.105", default-features = false, features = ["std"] }
 hickory-proto = { version = "=0.26.4", default-features = false, features = ["std"] }
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
+# TLS: reqwest's `rustls-no-provider` leaves the crypto provider to us. We compile only
+# rustls' `ring` provider (no aws-lc-sys C build) and trust the bundled Mozilla roots,
+# because the final image is `scratch` with no system certificate store.
+# `http2` is needed: Quad9 answers HTTP/1.1 DoH with 505.
+reqwest = { version = "=0.13.2", default-features = false, features = ["rustls-no-provider", "http2"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+webpki-root-certs = { version = "=1.0.12", default-features = false }
 toml = { version = "=1.2.2", default-features = false, features = ["parse", "serde"] }
 
+
 [dev-dependencies]
-# Only the ignored live test fetches a list; blocking keeps it free of a tokio runtime.
-reqwest = { version = "=0.13.2", default-features = false, features = ["blocking", "rustls"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["test-util"] }

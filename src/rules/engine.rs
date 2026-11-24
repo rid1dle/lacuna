@@ -440,13 +440,20 @@ mod tests {
     }
 
     /// Reads the reference list live; run with `-- --ignored live_adguard_dns_filter_counts`.
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn live_adguard_dns_filter_counts() {
+    async fn live_adguard_dns_filter_counts() {
         let url = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";
-        let body = reqwest::blocking::get(url)
-            .and_then(|r| r.text())
-            .expect("fetch filter_1.txt");
+        let body = crate::dns::upstream::client_builder()
+            .build()
+            .expect("client")
+            .get(url)
+            .send()
+            .await
+            .expect("fetch filter_1.txt")
+            .text()
+            .await
+            .expect("body");
         let (set, stats) = RuleSet::build(&[], &[(1, &body)]);
         let st = &stats[1];
         println!(
