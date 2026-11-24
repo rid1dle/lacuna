@@ -1,0 +1,9 @@
+[package]
+name = "sieve"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { version = "=1.0.105", default-features = false, features = ["std"] }
+serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
+toml = { version = "=1.2.2", default-features = false, features = ["parse", "serde"] }

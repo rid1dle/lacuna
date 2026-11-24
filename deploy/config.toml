@@ -1,0 +1,57 @@
+# Parity with the AdGuard Home setup it replaces.
+
+user_rules = []
+
+[dns]
+listen = "0.0.0.0:5353"
+refused_names = ["version.bind", "id.server", "hostname.bind"]
+blocked_ttl = 10
+max_inflight = 300
+router = "192.168.0.1"
+
+[upstreams]
+fallback = ["9.9.9.9:53", "1.1.1.1:53"]
+race_timeout_ms = 1000
+
+[[upstreams.doh]]
+url = "https://dns10.quad9.net/dns-query"
+bootstrap = ["9.9.9.10", "149.112.112.10"]
+
+[[upstreams.doh]]
+url = "https://cloudflare-dns.com/dns-query"
+bootstrap = ["1.1.1.1", "1.0.0.1"]
+
+[[lists]]
+id = 1
+name = "AdGuard DNS filter"
+url = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"
+enabled = true
+
+[[lists]]
+id = 2
+name = "AdAway Default Blocklist"
+url = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_2.txt"
+enabled = false
+
+[[rewrites]]
+name = "home.riddlelab.dev"
+a = "192.168.0.107"
+
+[[rewrites]]
+name = "*.home.riddlelab.dev"
+a = "192.168.0.107"
+
+[devices]
+
+[api]
+listen = "0.0.0.0:8053"
+secret_file = "/run/secrets/sieve_api"
+query_timeout_ms = 5000
+row_cap = 10000
+max_concurrent = 2
+
+[store]
+path = "/data/sieve.db"
+raw_days = 30
+rollup_days = 365
+lists_dir = "/data/lists"
