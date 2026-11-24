@@ -12,16 +12,17 @@ macro_rules! coded_enum {
 
         impl $name {
             /// Every variant, for tests and for generating the SQL label views.
-            #[allow(dead_code)]
+            #[allow(dead_code)] // Task 8 generates the label views from it.
             pub const ALL: &'static [$name] = &[$($name::$variant),+];
 
+            #[allow(dead_code)] // Task 8's writer stores it.
             pub fn code(self) -> u8 {
                 self as u8
             }
 
             /// `None` for a code this build does not know, so old or corrupt rows
             /// surface as a missing label instead of a panic.
-            #[allow(dead_code)]
+            #[allow(dead_code)] // Tests only so far; Task 8 reads codes back.
             pub fn from_code(code: u8) -> Option<Self> {
                 match code {
                     $($code => Some($name::$variant),)+
@@ -29,7 +30,7 @@ macro_rules! coded_enum {
                 }
             }
 
-            #[allow(dead_code)]
+            #[allow(dead_code)] // Task 8 generates the label views from it.
             pub fn label(self) -> &'static str {
                 match self {
                     $($name::$variant => $label),+

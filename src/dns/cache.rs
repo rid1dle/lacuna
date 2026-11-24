@@ -95,6 +95,7 @@ impl Cache {
         entries.insert(key, entry);
     }
 
+    #[allow(dead_code)] // Tests only so far; for sizing checks in Task 15.
     pub fn len(&self) -> usize {
         self.lock().len()
     }

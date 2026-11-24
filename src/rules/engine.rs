@@ -188,6 +188,7 @@ impl RuleSet {
     }
 
     /// Rough heap bytes of the tables (slots plus key text plus rule arena), for sizing checks.
+    #[allow(dead_code)] // Tests only so far; for sizing checks in Task 15.
     pub fn estimated_bytes(&self) -> usize {
         let keys = |it: &mut dyn Iterator<Item = &Box<str>>| it.map(|k| k.len()).sum::<usize>();
         self.suffix.capacity() * (std::mem::size_of::<(Box<str>, Entry)>() + 1)

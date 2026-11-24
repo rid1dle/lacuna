@@ -163,13 +163,20 @@ impl Upstream for DohUpstream {
 pub struct UdpUpstream {
     addr: SocketAddr,
     name: String,
+    timeout: Duration,
 }
 
 impl UdpUpstream {
     pub fn new(addr: SocketAddr) -> Self {
+        Self::with_timeout(addr, FALLBACK_TIMEOUT)
+    }
+
+    /// For a one-off query (the `ask` command) that can afford a longer wait.
+    pub fn with_timeout(addr: SocketAddr, timeout: Duration) -> Self {
         UdpUpstream {
             addr,
             name: format!("udp:{addr}"),
+            timeout,
         }
     }
 
@@ -240,7 +247,7 @@ impl Upstream for UdpUpstream {
                 Ok(m)
             }
         };
-        let mut answer = tokio::time::timeout(FALLBACK_TIMEOUT, exchange)
+        let mut answer = tokio::time::timeout(self.timeout, exchange)
             .await
             .map_err(|_| anyhow!("timed out"))??;
         answer.metadata.id = q.metadata.id;

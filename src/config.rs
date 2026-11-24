@@ -21,8 +21,10 @@ pub struct Config {
     pub rewrites: Vec<Rewrite>,
     /// Friendly names for client IPs, shown in the query log.
     #[serde(default)]
+    #[allow(dead_code)] // Read by Task 10's device names.
     pub devices: BTreeMap<IpAddr, String>,
     pub api: ApiConfig,
+    #[allow(dead_code)] // Read by Task 8's store.
     pub store: StoreConfig,
 }
 
@@ -36,6 +38,7 @@ pub struct DnsConfig {
     pub blocked_ttl: u32,
     pub max_inflight: usize,
     /// The router's address, used for local PTR answers.
+    #[allow(dead_code)] // Read by Task 10's device names.
     pub router: IpAddr,
 }
 
@@ -60,6 +63,7 @@ pub struct DohUpstream {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)] // Name, url and enabled are read by Task 9's list manager.
 pub struct ListConfig {
     pub id: u32,
     pub name: String,
@@ -67,7 +71,7 @@ pub struct ListConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rewrite {
     /// An exact name, or `*.suffix` to match every name below the suffix.
@@ -77,6 +81,7 @@ pub struct Rewrite {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)] // Read by Tasks 11 and 12 (query executor, API).
 pub struct ApiConfig {
     pub listen: SocketAddr,
     pub secret_file: PathBuf,
@@ -87,6 +92,7 @@ pub struct ApiConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)] // Read by Task 8's store.
 pub struct StoreConfig {
     pub path: PathBuf,
     pub raw_days: u32,

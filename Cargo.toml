@@ -13,9 +13,11 @@ serde = { version = "=1.0.229", default-features = false, features = ["derive", 
 # `http2` is needed: Quad9 answers HTTP/1.1 DoH with 505.
 reqwest = { version = "=0.13.2", default-features = false, features = ["rustls-no-provider", "http2"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
-tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 webpki-root-certs = { version = "=1.0.12", default-features = false }
 toml = { version = "=1.2.2", default-features = false, features = ["parse", "serde"] }
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt"] }
 
 [dev-dependencies]
 tokio = { version = "=1.54.1", default-features = false, features = ["test-util"] }
