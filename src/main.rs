@@ -1,5 +1,5 @@
 // Config, codes and rules are consumed by later tasks; silence dead-code noise until then.
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code)]
 
 mod codes;
 mod config;

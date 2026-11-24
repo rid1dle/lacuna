@@ -96,8 +96,8 @@ pub struct StoreConfig {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         Config::parse(&text).with_context(|| format!("in {}", path.display()))
     }
 
@@ -108,16 +108,26 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        ensure!(self.dns.max_inflight > 0, "dns.max_inflight must be above 0");
+        ensure!(
+            self.dns.max_inflight > 0,
+            "dns.max_inflight must be above 0"
+        );
         ensure!(
             !self.upstreams.doh.is_empty() || !self.upstreams.fallback.is_empty(),
             "upstreams needs at least one doh or fallback server"
         );
         for d in &self.upstreams.doh {
-            ensure!(d.url.starts_with("https://"), "doh url must be https: {}", d.url);
+            ensure!(
+                d.url.starts_with("https://"),
+                "doh url must be https: {}",
+                d.url
+            );
         }
         ensure!(self.api.row_cap > 0, "api.row_cap must be above 0");
-        ensure!(self.api.max_concurrent > 0, "api.max_concurrent must be above 0");
+        ensure!(
+            self.api.max_concurrent > 0,
+            "api.max_concurrent must be above 0"
+        );
 
         let mut seen = std::collections::BTreeSet::new();
         for l in &self.lists {

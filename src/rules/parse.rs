@@ -18,6 +18,8 @@ pub struct Rule {
     pub kind: RuleKind,
     pub important: bool,
     pub badfilter: bool,
+    /// Hosts-file lines match the exact name only, like AdGuard; `||domain^` also covers subdomains.
+    pub exact_only: bool,
     /// The original line, trimmed.
     pub text: String,
 }
@@ -42,8 +44,19 @@ pub enum SkipReason {
 
 /// AdGuard/uBO modifiers worth counting by name.
 const KNOWN_MODIFIERS: [&str; 13] = [
-    "client", "dnstype", "denyallow", "dnsrewrite", "ctag", "third-party", "domain", "script",
-    "image", "popup", "document", "all", "match-case",
+    "client",
+    "dnstype",
+    "denyallow",
+    "dnsrewrite",
+    "ctag",
+    "third-party",
+    "domain",
+    "script",
+    "image",
+    "popup",
+    "document",
+    "all",
+    "match-case",
 ];
 
 impl SkipReason {
@@ -69,8 +82,10 @@ impl SkipReason {
 
 /// Names a hosts file lists for the machine itself; they are not ad rules.
 fn is_hosts_boilerplate(name: &str) -> bool {
-    matches!(name, "localhost" | "localhost.localdomain" | "broadcasthost" | "local")
-        || name.starts_with("ip6-")
+    matches!(
+        name,
+        "localhost" | "localhost.localdomain" | "broadcasthost" | "local"
+    ) || name.starts_with("ip6-")
 }
 
 pub fn parse_line(line: &str) -> Parsed {
@@ -91,6 +106,10 @@ pub fn parse_line(line: &str) -> Parsed {
 
     // A regex rule is /.../ and may itself contain `$`, so test it before splitting modifiers.
     if rest.len() > 1 && rest.starts_with('/') && rest.ends_with('/') {
+        return Parsed::Skip(SkipReason::Regex);
+    }
+    // `/re$x/$important`: the regex ends at the last `/` that opens the modifiers.
+    if rest.starts_with('/') && rest.rfind("/$").is_some_and(|i| i > 0) {
         return Parsed::Skip(SkipReason::Regex);
     }
 
@@ -132,9 +151,14 @@ pub fn parse_line(line: &str) -> Parsed {
 
     Parsed::Rule(Rule {
         domain,
-        kind: if allow { RuleKind::Allow } else { RuleKind::Block },
+        kind: if allow {
+            RuleKind::Allow
+        } else {
+            RuleKind::Block
+        },
         important,
         badfilter,
+        exact_only: false,
         text: text.to_string(),
     })
 }
@@ -148,7 +172,10 @@ fn parse_hosts(text: &str) -> Parsed {
     };
     let extra: Vec<&str> = tokens.collect();
     // A line naming only the machine itself (`127.0.0.1 localhost localhost.localdomain`) is boilerplate.
-    if std::iter::once(name).chain(extra.iter().copied()).all(|n| is_hosts_boilerplate(&n.to_ascii_lowercase())) {
+    if std::iter::once(name)
+        .chain(extra.iter().copied())
+        .all(|n| is_hosts_boilerplate(&n.to_ascii_lowercase()))
+    {
         return Parsed::Blank;
     }
     if !extra.is_empty() {
@@ -166,6 +193,7 @@ fn parse_hosts(text: &str) -> Parsed {
         },
         important: false,
         badfilter: false,
+        exact_only: true,
         text: text.to_string(),
     })
 }
@@ -176,8 +204,12 @@ fn normalize_domain(raw: &str) -> Option<String> {
     let name = raw.strip_suffix('.').unwrap_or(raw).to_ascii_lowercase();
     let valid = !name.is_empty()
         && name.len() <= 253
-        && name.split('.').all(|label| !label.is_empty() && label.len() <= 63)
-        && name.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'));
+        && name
+            .split('.')
+            .all(|label| !label.is_empty() && label.len() <= 63)
+        && name
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'));
     valid.then_some(name)
 }
 
@@ -230,7 +262,10 @@ mod tests {
         assert_eq!(rule("0.0.0.0 tracker.net").kind, RuleKind::Block);
         assert_eq!(rule("127.0.0.1 tracker.net").kind, RuleKind::Block);
         assert_eq!(rule("::1 tracker.net").kind, RuleKind::Block);
-        assert_eq!(rule("0.0.0.0\ttracker.net # trailing").domain, "tracker.net");
+        assert_eq!(
+            rule("0.0.0.0\ttracker.net # trailing").domain,
+            "tracker.net"
+        );
         let r = rule("10.1.2.3 intranet.example");
         assert_eq!(r.kind, RuleKind::HostsIp("10.1.2.3".parse().unwrap()));
         assert_eq!(r.domain, "intranet.example");
@@ -278,7 +313,10 @@ mod tests {
             assert_eq!(skip(&line), SkipReason::Modifier(name.into()), "{line}");
         }
         // One unsupported modifier poisons the rule even beside a supported one.
-        assert_eq!(skip("||x.com^$important,client=1.2.3.4"), SkipReason::Modifier("client".into()));
+        assert_eq!(
+            skip("||x.com^$important,client=1.2.3.4"),
+            SkipReason::Modifier("client".into())
+        );
     }
 
     #[test]
@@ -294,7 +332,15 @@ mod tests {
 
     #[test]
     fn invalid_shapes() {
-        for line in ["||^", "||.example.com^", "||a..b^", "||exa mple.com^", "||bücher.de^", "||x.com^$", "garbage line here"] {
+        for line in [
+            "||^",
+            "||.example.com^",
+            "||a..b^",
+            "||exa mple.com^",
+            "||bücher.de^",
+            "||x.com^$",
+            "garbage line here",
+        ] {
             assert_eq!(skip(line), SkipReason::Invalid, "{line}");
         }
         assert!(matches!(parse_line("||xn--bcher-kva.de^"), Parsed::Rule(_)));
@@ -310,16 +356,44 @@ mod tests {
 
     #[test]
     fn multi_name_boilerplate_hosts_lines_are_blank() {
-        assert_eq!(parse_line("127.0.0.1 localhost localhost.localdomain"), Parsed::Blank);
-        assert_eq!(parse_line("::1 localhost ip6-localhost ip6-loopback"), Parsed::Blank);
+        assert_eq!(
+            parse_line("127.0.0.1 localhost localhost.localdomain"),
+            Parsed::Blank
+        );
+        assert_eq!(
+            parse_line("::1 localhost ip6-localhost ip6-loopback"),
+            Parsed::Blank
+        );
         assert_eq!(skip("0.0.0.0 localhost a.com"), SkipReason::Invalid);
     }
 
     #[test]
+    fn regex_with_dollar_inside_is_regex() {
+        assert_eq!(skip("/a$b/$important"), SkipReason::Regex);
+    }
+
+    #[test]
+    fn hosts_lines_are_exact_only_and_adblock_rules_are_not() {
+        assert!(rule("0.0.0.0 tracker.net").exact_only);
+        assert!(rule("10.1.2.3 intranet.example").exact_only);
+        assert!(!rule("||ads.example.com^").exact_only);
+        assert!(!rule("plain.example.org").exact_only);
+    }
+
+    #[test]
     fn modifier_labels_are_bounded() {
-        assert_eq!(SkipReason::Modifier("DNSTYPE".into()).label(), "modifier:dnstype");
-        assert_eq!(SkipReason::Modifier("third-party".into()).label(), "modifier:third-party");
-        assert_eq!(SkipReason::Modifier("random-list-text".into()).label(), "modifier:other");
+        assert_eq!(
+            SkipReason::Modifier("DNSTYPE".into()).label(),
+            "modifier:dnstype"
+        );
+        assert_eq!(
+            SkipReason::Modifier("third-party".into()).label(),
+            "modifier:third-party"
+        );
+        assert_eq!(
+            SkipReason::Modifier("random-list-text".into()).label(),
+            "modifier:other"
+        );
     }
 
     #[test]
@@ -328,6 +402,9 @@ mod tests {
         assert_eq!(SkipReason::Wildcard.label(), "wildcard");
         assert_eq!(SkipReason::UrlPath.label(), "url_path");
         assert_eq!(SkipReason::Invalid.label(), "invalid");
-        assert_eq!(SkipReason::Modifier("client".into()).label(), "modifier:client");
+        assert_eq!(
+            SkipReason::Modifier("client".into()).label(),
+            "modifier:client"
+        );
     }
 }
