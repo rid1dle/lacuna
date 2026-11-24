@@ -56,9 +56,9 @@ impl Cache {
             return Lookup::Miss;
         };
         if now < entry.expires {
-            // Round up so a live entry never advertises TTL 0, which clients read as "do not cache".
+            // Round up: now < expires, so this is at least 1 and a live entry never shows TTL 0.
             let remaining = (entry.expires - now).as_secs_f64().ceil() as u32;
-            return Lookup::Fresh(with_ttl(&entry.response, remaining.max(1)));
+            return Lookup::Fresh(with_ttl(&entry.response, remaining));
         }
         if now < entry.expires + STALE_WINDOW {
             return Lookup::Stale(with_ttl(&entry.response, STALE_TTL));
@@ -73,6 +73,8 @@ impl Cache {
             return;
         };
         let expires = now + Duration::from_secs(u64::from(ttl));
+        // Clone before locking so the critical section is only the map update.
+        let entry = Entry { response: response.clone(), expires };
         let mut entries = self.lock();
         if !entries.contains_key(&key) && entries.len() >= self.max_entries {
             // A scan is fine at this size; a heap would only pay off if profiling says so.
@@ -81,7 +83,7 @@ impl Cache {
                 entries.remove(&k);
             }
         }
-        entries.insert(key, Entry { response: response.clone(), expires });
+        entries.insert(key, entry);
     }
 
     pub fn len(&self) -> usize {
@@ -293,5 +295,39 @@ mod tests {
         assert_eq!(out.authorities[0].ttl, 30);
         assert_eq!(out.additionals[0].ttl, 30);
         assert!(out.edns.is_some());
+    }
+
+    fn nodata(soa_ttl: Option<(u32, u32)>) -> Message {
+        let mut m = Message::response(7, hickory_proto::op::OpCode::Query);
+        if let Some((ttl, minimum)) = soa_ttl {
+            let apex = Name::from_str("example.com.").unwrap();
+            let soa = SOA::new(apex.clone(), apex.clone(), 1, 0, 0, 0, minimum);
+            m.add_authority(Record::from_rdata(apex, ttl, RData::SOA(soa)));
+        }
+        m
+    }
+
+    #[test]
+    fn nodata_is_cached_by_soa_min_and_skipped_without_soa() {
+        let cache = Cache::new(10);
+        let t0 = Instant::now();
+        cache.put(key("nodata.com"), &nodata(Some((900, 45))), t0);
+        assert!(matches!(cache.get(&key("nodata.com"), t0 + secs(44)), Lookup::Fresh(_)));
+        assert!(matches!(cache.get(&key("nodata.com"), t0 + secs(45)), Lookup::Stale(_)));
+
+        cache.put(key("nosoa.com"), &nodata(None), t0);
+        assert!(matches!(cache.get(&key("nosoa.com"), t0), Lookup::Miss));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn fractional_remaining_seconds_round_up() {
+        let cache = Cache::new(10);
+        let t0 = Instant::now();
+        cache.put(key("example.com"), &a_response(&[120]), t0);
+        match cache.get(&key("example.com"), t0 + Duration::from_millis(20_500)) {
+            Lookup::Fresh(m) => assert_eq!(answer_ttls(&m), vec![100]),
+            other => panic!("expected Fresh, got {other:?}"),
+        }
     }
 }
