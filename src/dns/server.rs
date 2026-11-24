@@ -8,17 +8,23 @@ use anyhow::{Context, Result};
 use hickory_proto::op::{Message, ResponseCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use super::answer;
 use super::pipeline::{LogSink, Pipeline};
 use super::upstream::Upstream;
 
-/// How long a TCP client has to send its next query, and to finish each frame.
+/// How long a TCP client has to send its next query, to finish each frame, and to take
+/// each answer off our hands.
 const TCP_IDLE: Duration = Duration::from_secs(10);
 /// Largest UDP message read or sent, whatever a client's EDNS asks for. A longer
 /// datagram is cut short by the kernel and then fails to parse.
 const UDP_MAX: usize = 4096;
+/// Open TCP connections at once; more are closed as soon as they are accepted.
+const TCP_MAX_CONNECTIONS: usize = 128;
+/// Pause after a failed accept or receive, so a persistent error cannot spin a core.
+const ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Both sockets, bound before serving so the caller can learn the real address.
 pub struct Listeners {
@@ -96,16 +102,28 @@ async fn respond<U: Upstream + 'static>(
     } else {
         usize::from(u16::MAX)
     };
-    let (resp, record) = pipeline.handle(query, client).await;
+    let (resp, mut record) = pipeline.handle(query, client).await;
+    let encoded = encode(&resp, limit);
+    // The row lists what the client got: no addresses when the records were dropped.
+    if !matches!(encoded, Some((_, Sent::Whole))) {
+        record.answers.clear();
+    }
     log.send(record);
-    encode(&resp, limit)
+    encoded.map(|(wire, _)| wire)
+}
+
+/// Whether the encoded reply carries the response's records.
+enum Sent {
+    Whole,
+    /// Truncated, or replaced by SERVFAIL: no records went out.
+    WithoutRecords,
 }
 
 /// Encodes `resp`. Past `limit` bytes it goes out truncated (TC set, records dropped),
 /// which tells the client to ask again over TCP.
-fn encode(resp: &Message, limit: usize) -> Option<Vec<u8>> {
-    match resp.to_vec() {
-        Ok(wire) if wire.len() <= limit => Some(wire),
+fn encode(resp: &Message, limit: usize) -> Option<(Vec<u8>, Sent)> {
+    let wire = match resp.to_vec() {
+        Ok(wire) if wire.len() <= limit => return Some((wire, Sent::Whole)),
         Ok(_) => resp.truncate().to_vec().ok(),
         Err(e) => {
             warn!("encoding response: {e}");
@@ -114,7 +132,8 @@ fn encode(resp: &Message, limit: usize) -> Option<Vec<u8>> {
             failed.metadata.response_code = ResponseCode::ServFail;
             failed.to_vec().ok()
         }
-    }
+    };
+    wire.map(|w| (w, Sent::WithoutRecords))
 }
 
 /// One socket; each datagram is handled in its own task so a slow upstream answer never
@@ -132,6 +151,7 @@ async fn serve_udp<U: Upstream + 'static>(
             // Linux reports an ICMP error for an earlier send here; the socket is fine.
             Err(e) => {
                 debug!("udp recv: {e}");
+                tokio::time::sleep(ERROR_BACKOFF).await;
                 continue;
             }
         };
@@ -152,16 +172,25 @@ async fn serve_tcp<U: Upstream + 'static>(
     listener: TcpListener,
     log: Arc<dyn LogSink>,
 ) {
+    let slots = Arc::new(Semaphore::new(TCP_MAX_CONNECTIONS));
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                // Over the cap the stream is dropped here, which closes it.
+                let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                    debug!(%peer, "tcp connection cap reached");
+                    continue;
+                };
                 let (pipeline, log) = (Arc::clone(&pipeline), Arc::clone(&log));
-                tokio::spawn(async move { connection(&pipeline, &*log, stream, peer.ip()).await });
+                tokio::spawn(async move {
+                    connection(&pipeline, &*log, stream, peer.ip()).await;
+                    drop(slot);
+                });
             }
             Err(e) => {
-                // Usually out of file descriptors: back off instead of spinning.
+                // Usually out of file descriptors.
                 warn!("tcp accept: {e}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(ERROR_BACKOFF).await;
             }
         }
     }
@@ -169,7 +198,8 @@ async fn serve_tcp<U: Upstream + 'static>(
 
 /// DNS over TCP frames each message with a 2-byte big-endian length (RFC 1035 4.2.2).
 /// Queries on one connection are answered in order. The connection closes when the
-/// client closes it, after `TCP_IDLE` with no new query, or when a frame stalls.
+/// client closes it, after `TCP_IDLE` with no new query, when a frame stalls or is empty,
+/// or when the client stops reading answers.
 async fn connection<U: Upstream + 'static>(
     pipeline: &Pipeline<U>,
     log: &dyn LogSink,
@@ -181,7 +211,11 @@ async fn connection<U: Upstream + 'static>(
         if !read_in_time(&mut stream, &mut len).await {
             return;
         }
-        let mut frame = vec![0u8; usize::from(u16::from_be_bytes(len))];
+        let len = usize::from(u16::from_be_bytes(len));
+        if len == 0 {
+            return;
+        }
+        let mut frame = vec![0u8; len];
         if !read_in_time(&mut stream, &mut frame).await {
             return;
         }
@@ -196,7 +230,8 @@ async fn connection<U: Upstream + 'static>(
         let mut out = Vec::with_capacity(2 + reply.len());
         out.extend_from_slice(&reply_len.to_be_bytes());
         out.extend_from_slice(&reply);
-        if stream.write_all(&out).await.is_err() {
+        let written = tokio::time::timeout(TCP_IDLE, stream.write_all(&out)).await;
+        if !matches!(written, Ok(Ok(()))) {
             return;
         }
     }
@@ -393,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_truncates_to_client_payload() {
-        let (addr, _) = start().await;
+        let (addr, log) = start().await;
         let sock = udp_client().await;
 
         // 40 A records do not fit in 512 bytes: TC set, answers dropped.
@@ -405,6 +440,9 @@ mod tests {
         assert!(m.metadata.truncation);
         assert!(m.answers.is_empty());
         assert_eq!(m.metadata.id, 31);
+        // The log row lists what was sent, which is nothing.
+        let row = log.0.lock().unwrap().last().cloned().unwrap();
+        assert!(row.answers.is_empty(), "{:?}", row.answers);
 
         // With EDNS 4096 the same answer fits.
         let mut q = query("big.example.", RecordType::A);
@@ -418,6 +456,7 @@ mod tests {
         let m = Message::from_vec(&reply).unwrap();
         assert!(!m.metadata.truncation);
         assert_eq!(m.answers.len(), 40);
+        assert_eq!(log.0.lock().unwrap().last().unwrap().answers.len(), 40);
 
         // TCP has no such limit.
         let mut s = TcpStream::connect(addr).await.unwrap();
@@ -442,5 +481,79 @@ mod tests {
             assert_eq!(read.expect("closed before 60s").unwrap(), 0);
             assert!(started.elapsed() >= Duration::from_secs(10));
         }
+    }
+
+    /// A client that sends queries but never reads: once the socket buffers fill, the
+    /// server's write stalls and must give up after TCP_IDLE instead of holding the
+    /// connection forever. Each `huge.` answer is about 32 KB; 600 of them are far more
+    /// than loopback buffers hold, so the server can only finish by timing out.
+    #[tokio::test(start_paused = true)]
+    async fn tcp_client_that_never_reads_is_dropped() {
+        const SENT: usize = 600;
+        let (addr, _) = start().await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let mut burst = Vec::new();
+        for id in 0..SENT as u16 {
+            let q = wire("huge.example.", id);
+            burst.extend_from_slice(&(q.len() as u16).to_be_bytes());
+            burst.extend_from_slice(&q);
+        }
+        s.write_all(&burst).await.unwrap();
+        // Paused time jumps ahead whenever everything is blocked.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        // Now drain. A server that gave up sent fewer answers than queries.
+        let mut answered = 0;
+        loop {
+            let mut len = [0u8; 2];
+            if s.read_exact(&mut len).await.is_err() {
+                break;
+            }
+            let mut body = vec![0u8; usize::from(u16::from_be_bytes(len))];
+            if s.read_exact(&mut body).await.is_err() {
+                break;
+            }
+            answered += 1;
+        }
+        assert!(
+            answered > 0 && answered < SENT,
+            "answered {answered} of {SENT}"
+        );
+    }
+
+    /// EOF or reset within 2s, well before the 10s idle timeout.
+    async fn closed_soon(mut s: TcpStream) -> bool {
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await;
+        matches!(read, Ok(Ok(0)) | Ok(Err(_)))
+    }
+
+    #[tokio::test]
+    async fn tcp_empty_frame_closes_the_connection() {
+        let (addr, _) = start().await;
+        // A zero-length frame is not a DNS message.
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(&[0, 0]).await.unwrap();
+        assert!(closed_soon(s).await, "empty frame kept open");
+    }
+
+    #[tokio::test]
+    async fn tcp_connections_over_the_cap_are_closed() {
+        let (addr, _) = start().await;
+        let mut held = Vec::new();
+        for _ in 0..TCP_MAX_CONNECTIONS {
+            held.push(TcpStream::connect(addr).await.unwrap());
+        }
+        // Give the server time to accept them all.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let over = TcpStream::connect(addr).await.unwrap();
+        assert!(closed_soon(over).await, "connection over the cap kept open");
+
+        // Freed slots are reused.
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        tcp_send(&mut s, &wire("home.riddlelab.dev.", 41)).await;
+        assert!(home_a(&tcp_recv(&mut s).await));
     }
 }

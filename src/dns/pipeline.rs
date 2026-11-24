@@ -6,11 +6,11 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, OpCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME};
 use hickory_proto::rr::{Name, RData, RecordType};
 use tokio::sync::Semaphore;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::answer::{self, REWRITE_TTL};
 use super::cache::{Cache, CacheKey, Lookup};
@@ -104,6 +104,16 @@ enum FetchError {
     Failed(UpstreamError),
 }
 
+impl FetchError {
+    /// Hitting the cap is load, not a fault, so it stays out of the default log.
+    fn log(&self, name: &str, context: &str) {
+        match self {
+            FetchError::Busy => debug!(%name, "{context}{self}"),
+            FetchError::Failed(_) => warn!(%name, "{context}{self}"),
+        }
+    }
+}
+
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -160,6 +170,38 @@ impl Decision {
             rule: Some((list_id, rule)),
             ..Decision::local(outcome, reason)
         }
+    }
+
+    /// Passed the filters; `allowed_by` is the allow rule that let it through, if any.
+    fn allowed(
+        served_from: ServedFrom,
+        allowed_by: Option<(u32, Arc<str>)>,
+        upstream: Option<String>,
+    ) -> Self {
+        Decision {
+            outcome: Outcome::Allowed,
+            reason: if allowed_by.is_some() {
+                Reason::Rule
+            } else {
+                Reason::None
+            },
+            served_from,
+            rule: allowed_by,
+            upstream,
+        }
+    }
+}
+
+/// Clears a key from `Resolver::refreshing` when dropped, so a refresh task that panics
+/// or is cancelled cannot leave its key marked as refreshing forever.
+struct RefreshGuard<U: Upstream> {
+    resolver: Arc<Resolver<U>>,
+    key: CacheKey,
+}
+
+impl<U: Upstream> Drop for RefreshGuard<U> {
+    fn drop(&mut self) {
+        lock(&self.resolver.refreshing).remove(&self.key);
     }
 }
 
@@ -234,9 +276,15 @@ impl<U: Upstream + 'static> Pipeline<U> {
         (resp, record)
     }
 
-    /// The fixed order: ANY, refused names, rewrites, rules on the name, cache, upstream,
-    /// CNAME check, cache put.
+    /// The fixed order: opcode, ANY, refused names, rewrites, rules on the name, cache,
+    /// upstream, CNAME check, cache put.
     async fn decide(&self, query: &Message, name: &str) -> (Message, Decision) {
+        // UPDATE and friends must never reach rewrites (a NOERROR would look like success)
+        // or upstream (it would leak LAN names); the cache key does not include the opcode.
+        if query.metadata.op_code != OpCode::Query {
+            let d = Decision::local(Outcome::Refused, Reason::None);
+            return (answer::notimp(query), d);
+        }
         let Some(q) = query.queries.first() else {
             let resp = answer::formerr(query.metadata.id);
             return (resp, Decision::local(Outcome::Refused, Reason::None));
@@ -285,11 +333,8 @@ impl<U: Upstream + 'static> Pipeline<U> {
             Lookup::Miss => match self.resolver.fetch(query).await {
                 Ok((m, from, upstream)) => (m, from, Some(upstream), true),
                 Err(e) => {
-                    warn!(%name, "{e}");
-                    let d = Decision {
-                        served_from: ServedFrom::Upstream,
-                        ..Decision::local(Outcome::Allowed, Reason::None)
-                    };
+                    e.log(name, "");
+                    let d = Decision::allowed(ServedFrom::Upstream, allowed_by, None);
                     return (answer::servfail(query), d);
                 }
             },
@@ -308,17 +353,7 @@ impl<U: Upstream + 'static> Pipeline<U> {
             };
             return (answer::blocked(query, live.blocked_ttl), d);
         }
-        let d = Decision {
-            outcome: Outcome::Allowed,
-            reason: if allowed_by.is_some() {
-                Reason::Rule
-            } else {
-                Reason::None
-            },
-            served_from,
-            rule: allowed_by,
-            upstream,
-        };
+        let d = Decision::allowed(served_from, allowed_by, upstream);
         (for_client(resp, query), d)
     }
 
@@ -327,13 +362,16 @@ impl<U: Upstream + 'static> Pipeline<U> {
         if !lock(&self.resolver.refreshing).insert(key.clone()) {
             return;
         }
-        let resolver = Arc::clone(&self.resolver);
+        let guard = RefreshGuard {
+            resolver: Arc::clone(&self.resolver),
+            key,
+        };
         tokio::spawn(async move {
+            let RefreshGuard { resolver, key } = &guard;
             match resolver.fetch(&query).await {
                 Ok((m, _, _)) => resolver.cache.put(key.clone(), &m, now()),
-                Err(e) => warn!(name = %key.name, "background refresh: {e}"),
+                Err(e) => e.log(&key.name, "background refresh: "),
             }
-            lock(&resolver.refreshing).remove(&key);
         });
     }
 }
@@ -434,7 +472,7 @@ pub mod testing {
 
     /// Answers A `192.0.2.<n>` where n counts the queries seen, so a refreshed answer is
     /// told apart from the old one. `a.com` answers `CNAME track.adnet.com` first; names
-    /// under `big.` get 40 A records. Down means sleeping far past the 2s deadline.
+    /// under `big.` get 40 A records, under `huge.` 2000 (about 32 KB on the wire). Down means sleeping far past the 2s deadline.
     pub struct Fake {
         pub name: &'static str,
         pub delay: Duration,
@@ -469,7 +507,13 @@ pub mod testing {
                 ));
                 owner = target;
             }
-            let count = if text.starts_with("big.") { 40 } else { 1 };
+            let count = if text.starts_with("huge.") {
+                2000
+            } else if text.starts_with("big.") {
+                40
+            } else {
+                1
+            };
             for i in 0..count {
                 let ip = Ipv4Addr::new(192, 0, 2, (n + i) as u8);
                 r.add_answer(Record::from_rdata(owner.clone(), FAKE_TTL, RData::A(A(ip))));
@@ -539,7 +583,7 @@ pub mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
-    use hickory_proto::op::ResponseCode;
+    use hickory_proto::op::{OpCode, ResponseCode};
     use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::{DNSClass, RData, RecordType};
     use std::net::{IpAddr, Ipv4Addr};
@@ -652,6 +696,8 @@ mod tests {
         let (resp, rec) = p.handle(query("a.com.", RecordType::A), CLIENT).await;
         assert_eq!(first_a(&resp), Some((Ipv4Addr::UNSPECIFIED, BLOCKED_TTL)));
         assert_eq!(resp.answers.len(), 1);
+        // The block answers for the name asked, not for the CNAME target.
+        assert_eq!(resp.answers[0].name.to_ascii(), "a.com.");
         assert_eq!(rec.outcome, Outcome::Blocked);
         assert_eq!(rec.reason, Reason::Cname);
         assert_eq!(rec.list_id, Some(1));
@@ -853,6 +899,40 @@ mod tests {
             .handle(query("three.example.", RecordType::A), CLIENT)
             .await;
         assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_query_opcode_is_notimp() {
+        let state = Arc::new(State::default());
+        let p = pipeline(rules(&[], ""), &state);
+        // An UPDATE for a rewritten name must not get the rewrite, nor go upstream.
+        for name in ["home.riddlelab.dev.", "printer.lan."] {
+            let mut q = query(name, RecordType::A);
+            q.metadata.op_code = OpCode::Update;
+            let (resp, rec) = p.handle(q, CLIENT).await;
+            assert_eq!(resp.metadata.response_code, ResponseCode::NotImp);
+            assert_eq!(resp.metadata.id, 0x4242);
+            assert_eq!(resp.metadata.op_code, OpCode::Update);
+            assert_eq!(rec.rcode, 4);
+            assert_eq!(rec.outcome, Outcome::Refused);
+            assert_eq!(rec.served_from, ServedFrom::Local);
+        }
+        assert_eq!(state.calls(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn allowlisted_servfail_keeps_the_allow_rule() {
+        let state = Arc::new(State::default());
+        let p = pipeline(rules(&["@@||ok.adnet.com^"], "||adnet.com^"), &state);
+        state.set_down(true);
+        let (resp, rec) = p
+            .handle(query("ok.adnet.com.", RecordType::A), CLIENT)
+            .await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(rec.outcome, Outcome::Allowed);
+        assert_eq!(rec.reason, Reason::Rule);
+        assert_eq!(rec.list_id, Some(0));
+        assert_eq!(rec.rule.as_deref(), Some("@@||ok.adnet.com^"));
     }
 
     #[tokio::test(start_paused = true)]

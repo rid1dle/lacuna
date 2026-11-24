@@ -77,6 +77,11 @@ pub fn servfail(query: &Message) -> Message {
     base(query, ResponseCode::ServFail)
 }
 
+/// For an opcode we do not serve (UPDATE, NOTIFY, ...): only QUERY is answered.
+pub fn notimp(query: &Message) -> Message {
+    base(query, ResponseCode::NotImp)
+}
+
 /// For a packet too broken to parse: all we know is the id.
 pub fn formerr(id: u16) -> Message {
     let mut resp = Message::error_msg(id, OpCode::Query, ResponseCode::FormErr);
@@ -206,6 +211,7 @@ mod tests {
         let q = query("x.example.", RecordType::A, false);
         check_common(&q, &refused(&q), ResponseCode::Refused);
         check_common(&q, &servfail(&q), ResponseCode::ServFail);
+        check_common(&q, &notimp(&q), ResponseCode::NotImp);
         let f = formerr(7);
         assert_eq!(f.metadata.id, 7);
         assert_eq!(f.metadata.response_code, ResponseCode::FormErr);
