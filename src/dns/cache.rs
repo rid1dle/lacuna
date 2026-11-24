@@ -43,7 +43,10 @@ struct Entry {
 
 impl Cache {
     pub fn new(max_entries: usize) -> Self {
-        Self { max_entries, entries: Mutex::new(HashMap::new()) }
+        Self {
+            max_entries,
+            entries: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Look `key` up at time `now`.
@@ -74,11 +77,17 @@ impl Cache {
         };
         let expires = now + Duration::from_secs(u64::from(ttl));
         // Clone before locking so the critical section is only the map update.
-        let entry = Entry { response: response.clone(), expires };
+        let entry = Entry {
+            response: response.clone(),
+            expires,
+        };
         let mut entries = self.lock();
         if !entries.contains_key(&key) && entries.len() >= self.max_entries {
             // A scan is fine at this size; a heap would only pay off if profiling says so.
-            let soonest = entries.iter().min_by_key(|(_, e)| e.expires).map(|(k, _)| k.clone());
+            let soonest = entries
+                .iter()
+                .min_by_key(|(_, e)| e.expires)
+                .map(|(k, _)| k.clone());
             if let Some(k) = soonest {
                 entries.remove(&k);
             }
@@ -112,13 +121,12 @@ fn cache_ttl(response: &Message) -> Option<u32> {
         }
         // NXDOMAIN and NODATA (NOERROR, no answers): RFC 2308 section 5 takes the SOA in the
         // authority section, and the lesser of its own TTL and its MINIMUM field.
-        ResponseCode::NoError | ResponseCode::NXDomain => response
-            .authorities
-            .iter()
-            .find_map(|r| match &r.data {
+        ResponseCode::NoError | ResponseCode::NXDomain => {
+            response.authorities.iter().find_map(|r| match &r.data {
                 RData::SOA(soa) => Some(r.ttl.min(soa.minimum)),
                 _ => None,
-            })?,
+            })?
+        }
         _ => return None,
     };
     (ttl > 0).then_some(ttl.min(MAX_TTL))
@@ -128,7 +136,12 @@ fn cache_ttl(response: &Message) -> Option<u32> {
 fn with_ttl(response: &Message, ttl: u32) -> Message {
     let mut out = response.clone();
     // The OPT pseudo-record lives in `edns`, not in these sections, so it is left alone.
-    for r in out.answers.iter_mut().chain(&mut out.authorities).chain(&mut out.additionals) {
+    for r in out
+        .answers
+        .iter_mut()
+        .chain(&mut out.authorities)
+        .chain(&mut out.additionals)
+    {
         r.ttl = ttl;
     }
     out
@@ -144,7 +157,12 @@ mod tests {
     use std::str::FromStr;
 
     fn key(name: &str) -> CacheKey {
-        CacheKey { name: name.into(), qtype: 1, qclass: 1, dnssec_ok: false }
+        CacheKey {
+            name: name.into(),
+            qtype: 1,
+            qclass: 1,
+            dnssec_ok: false,
+        }
     }
 
     fn a_response(ttls: &[u32]) -> Message {
@@ -203,7 +221,10 @@ mod tests {
         let t0 = Instant::now();
         cache.put(key("example.com"), &a_response(&[60]), t0);
         let edge = t0 + secs(60 + 12 * 3600);
-        assert!(matches!(cache.get(&key("example.com"), edge - secs(1)), Lookup::Stale(_)));
+        assert!(matches!(
+            cache.get(&key("example.com"), edge - secs(1)),
+            Lookup::Stale(_)
+        ));
         assert!(matches!(cache.get(&key("example.com"), edge), Lookup::Miss));
         // The dead entry is dropped on the miss.
         assert_eq!(cache.len(), 0);
@@ -252,7 +273,10 @@ mod tests {
         do_key.dnssec_ok = true;
         cache.put(key("example.com"), &a_response(&[60]), t0);
         assert!(matches!(cache.get(&do_key, t0), Lookup::Miss));
-        assert!(matches!(cache.get(&key("example.com"), t0), Lookup::Fresh(_)));
+        assert!(matches!(
+            cache.get(&key("example.com"), t0),
+            Lookup::Fresh(_)
+        ));
     }
 
     #[test]
@@ -261,8 +285,14 @@ mod tests {
         let t0 = Instant::now();
         // SOA minimum 60 is below the record TTL 900: entry lives 60s.
         cache.put(key("gone.com"), &nxdomain(900, 60), t0);
-        assert!(matches!(cache.get(&key("gone.com"), t0 + secs(59)), Lookup::Fresh(_)));
-        assert!(matches!(cache.get(&key("gone.com"), t0 + secs(60)), Lookup::Stale(_)));
+        assert!(matches!(
+            cache.get(&key("gone.com"), t0 + secs(59)),
+            Lookup::Fresh(_)
+        ));
+        assert!(matches!(
+            cache.get(&key("gone.com"), t0 + secs(60)),
+            Lookup::Stale(_)
+        ));
     }
 
     #[test]
@@ -270,8 +300,14 @@ mod tests {
         let cache = Cache::new(10);
         let t0 = Instant::now();
         cache.put(key("big.com"), &nxdomain(1_000_000, 1_000_000), t0);
-        assert!(matches!(cache.get(&key("big.com"), t0 + secs(86_399)), Lookup::Fresh(_)));
-        assert!(matches!(cache.get(&key("big.com"), t0 + secs(86_400)), Lookup::Stale(_)));
+        assert!(matches!(
+            cache.get(&key("big.com"), t0 + secs(86_399)),
+            Lookup::Fresh(_)
+        ));
+        assert!(matches!(
+            cache.get(&key("big.com"), t0 + secs(86_400)),
+            Lookup::Stale(_)
+        ));
 
         let mut bare = Message::response(7, hickory_proto::op::OpCode::Query);
         bare.metadata.response_code = ResponseCode::NXDomain;
@@ -285,8 +321,16 @@ mod tests {
         let t0 = Instant::now();
         let mut m = a_response(&[100]);
         let name = Name::from_str("ns.example.com.").unwrap();
-        m.add_authority(Record::from_rdata(name.clone(), 500, RData::A(A(Ipv4Addr::LOCALHOST))));
-        m.add_additional(Record::from_rdata(name, 700, RData::A(A(Ipv4Addr::LOCALHOST))));
+        m.add_authority(Record::from_rdata(
+            name.clone(),
+            500,
+            RData::A(A(Ipv4Addr::LOCALHOST)),
+        ));
+        m.add_additional(Record::from_rdata(
+            name,
+            700,
+            RData::A(A(Ipv4Addr::LOCALHOST)),
+        ));
         m.edns = Some(hickory_proto::op::Edns::new());
         cache.put(key("example.com"), &m, t0);
         let Lookup::Stale(out) = cache.get(&key("example.com"), t0 + secs(100)) else {
@@ -312,8 +356,14 @@ mod tests {
         let cache = Cache::new(10);
         let t0 = Instant::now();
         cache.put(key("nodata.com"), &nodata(Some((900, 45))), t0);
-        assert!(matches!(cache.get(&key("nodata.com"), t0 + secs(44)), Lookup::Fresh(_)));
-        assert!(matches!(cache.get(&key("nodata.com"), t0 + secs(45)), Lookup::Stale(_)));
+        assert!(matches!(
+            cache.get(&key("nodata.com"), t0 + secs(44)),
+            Lookup::Fresh(_)
+        ));
+        assert!(matches!(
+            cache.get(&key("nodata.com"), t0 + secs(45)),
+            Lookup::Stale(_)
+        ));
 
         cache.put(key("nosoa.com"), &nodata(None), t0);
         assert!(matches!(cache.get(&key("nosoa.com"), t0), Lookup::Miss));

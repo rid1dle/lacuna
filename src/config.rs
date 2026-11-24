@@ -126,6 +126,18 @@ impl Config {
                 "doh url must be https: {}",
                 d.url
             );
+            // Without a pinned address reqwest would resolve the host through the system
+            // resolver, which is sieve itself.
+            let host = reqwest::Url::parse(&d.url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+                .with_context(|| format!("bad doh url {}", d.url))?;
+            let is_ip = host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok();
+            ensure!(
+                is_ip || !d.bootstrap.is_empty(),
+                "doh {} needs bootstrap addresses (its host is a name)",
+                d.url
+            );
         }
         ensure!(self.api.row_cap > 0, "api.row_cap must be above 0");
         ensure!(
@@ -186,6 +198,22 @@ mod tests {
         let text = DEPLOY.replace("race_timeout_ms = 1000", "race_timeout_ms = 0");
         let err = Config::parse(&text).unwrap_err().to_string();
         assert!(err.contains("race_timeout_ms"), "{err}");
+    }
+
+    #[test]
+    fn rejects_doh_without_bootstrap_unless_ip_literal() {
+        let bare = DEPLOY.replace(
+            "bootstrap = [\"9.9.9.10\", \"149.112.112.10\"]",
+            "bootstrap = []",
+        );
+        assert_ne!(bare, DEPLOY, "fixture text moved");
+        let err = Config::parse(&bare).unwrap_err().to_string();
+        assert!(err.contains("bootstrap"), "{err}");
+        let literal = bare.replace(
+            "https://dns10.quad9.net/dns-query",
+            "https://9.9.9.10/dns-query",
+        );
+        assert!(Config::parse(&literal).is_ok());
     }
 
     #[test]

@@ -17,6 +17,5 @@ tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-t
 webpki-root-certs = { version = "=1.0.12", default-features = false }
 toml = { version = "=1.2.2", default-features = false, features = ["parse", "serde"] }
 
-
 [dev-dependencies]
 tokio = { version = "=1.54.1", default-features = false, features = ["test-util"] }
