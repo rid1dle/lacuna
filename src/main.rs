@@ -3,6 +3,7 @@
 
 mod codes;
 mod config;
+mod dns;
 mod rules;
 
 use std::path::Path;
