@@ -230,6 +230,7 @@ mod tests {
             refused(&q),
             servfail(&q),
             rewrite(&q, Ipv4Addr::LOCALHOST, 1),
+            hosts_ip(&q, IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
         ] {
             let r = wire(&r);
             assert_eq!(r.edns.as_ref().map(Edns::max_payload), Some(1232));
