@@ -134,12 +134,11 @@ impl RuleSet {
         }
 
         // Badfilter applies across lists, so it can only run once every list is read.
-        // A list's badfilter never cancels a user rule (list 0); the user's own can.
-        let cancelled: HashSet<String> = rules
-            .iter()
-            .filter(|(_, r)| r.badfilter)
-            .map(|(_, r)| badfilter_twin(&r.text))
-            .collect();
+        // A user badfilter (list 0) cancels any twin; a list's badfilter cancels list rules only.
+        let twins = |from_user: bool| -> HashSet<String> {
+            rules.iter().filter(|(id, r)| r.badfilter && (*id == 0) == from_user).map(|(_, r)| badfilter_twin(&r.text)).collect()
+        };
+        let (by_user, by_lists) = (twins(true), twins(false));
         let mut set = RuleSet::default();
         for (list_id, rule) in rules {
             let Rule {
@@ -150,7 +149,7 @@ impl RuleSet {
                 exact_only,
                 text,
             } = rule;
-            if badfilter || (list_id != 0 && cancelled.contains(&text)) {
+            if badfilter || by_user.contains(&text) || (list_id != 0 && by_lists.contains(&text)) {
                 continue;
             }
             set.count += 1;
@@ -402,6 +401,25 @@ mod tests {
             "Entry is {} bytes",
             std::mem::size_of::<Entry>()
         );
+    }
+
+    #[test]
+    fn matching_ignores_case_and_trailing_dot() {
+        let (set, _) = build(&[], &[(1, "||Example.COM^")]);
+        assert!(is_block(&set.check("WWW.EXAMPLE.com.")));
+        assert!(is_block(&set.check("example.com.")));
+        let (set, _) = build(&[], &[(1, "0.0.0.0 example.com")]);
+        assert!(is_block(&set.check("example.com.")));
+        assert!(is_block(&set.check("EXAMPLE.COM")));
+        assert_eq!(set.check("a.example.com"), Verdict::Pass);
+    }
+
+    #[test]
+    fn user_badfilter_cancels_user_and_list_twins() {
+        let (set, _) = build(&["||x.com^", "||x.com^$badfilter"], &[]);
+        assert_eq!(set.check("x.com"), Verdict::Pass);
+        let (set, _) = build(&["||x.com^$badfilter"], &[(1, "||x.com^")]);
+        assert_eq!(set.check("x.com"), Verdict::Pass);
     }
 
     #[test]
