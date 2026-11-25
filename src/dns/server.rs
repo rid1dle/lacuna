@@ -34,15 +34,23 @@ pub struct Listeners {
 
 impl Listeners {
     pub async fn bind(addr: SocketAddr) -> Result<Self> {
-        let udp = UdpSocket::bind(addr)
-            .await
-            .with_context(|| format!("binding udp {addr}"))?;
-        // With port 0 the OS picked one for UDP; TCP must listen on the same port.
-        let addr = udp.local_addr()?;
-        let tcp = TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("binding tcp {addr}"))?;
-        Ok(Listeners { udp, tcp })
+        // With port 0 the OS picks the UDP port and TCP must take the same number, which
+        // another socket may already hold: retry the pair. A fixed port gets one try.
+        let attempts = if addr.port() == 0 { 20 } else { 1 };
+        let mut last = None;
+        for _ in 0..attempts {
+            let udp = UdpSocket::bind(addr)
+                .await
+                .with_context(|| format!("binding udp {addr}"))?;
+            let bound = udp.local_addr()?;
+            match TcpListener::bind(bound).await {
+                Ok(tcp) => return Ok(Listeners { udp, tcp }),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => last = Some((bound, e)),
+                Err(e) => return Err(e).with_context(|| format!("binding tcp {bound}")),
+            }
+        }
+        let (bound, e) = last.context("no bind attempt was made")?;
+        Err(e).with_context(|| format!("binding tcp {bound}"))
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {

@@ -111,20 +111,20 @@ impl<U: Upstream> Devices<U> {
     pub async fn pass(&self, now: i64) -> Result<usize> {
         let db = self.db.clone();
         let due = tokio::task::spawn_blocking(move || due_clients(&db, now)).await??;
-        let mut found = Vec::with_capacity(due.len());
+        let mut found: Vec<(String, Lookup)> = Vec::with_capacity(due.len());
         for ip in &due {
             let Ok(addr) = ip.parse::<IpAddr>() else {
                 continue;
             };
-            let name = match self.router.query(&ptr_query(addr)).await {
-                Ok(answer) => name_from_answer(addr, &answer),
-                // A timeout is recorded like no answer: retried tomorrow, not every pass.
+            let outcome = match self.router.query(&ptr_query(addr)).await {
+                Ok(answer) => Lookup::Answer(name_from_answer(addr, &answer)),
+                // A timeout says nothing about the name: keep what is stored, retry tomorrow.
                 Err(e) => {
                     debug!(%ip, "ptr lookup failed: {e:#}");
-                    None
+                    Lookup::Failed
                 }
             };
-            found.push((ip.clone(), name));
+            found.push((ip.clone(), outcome));
         }
         let db = self.db.clone();
         let n = found.len();
@@ -155,7 +155,15 @@ fn due_clients(db: &Path, now: i64) -> Result<Vec<String>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-fn record(db: &Path, found: &[(String, Option<String>)], now: i64) -> Result<()> {
+/// What one PTR lookup showed.
+enum Lookup {
+    /// The router answered: a usable name, or None for an answer that names nothing.
+    Answer(Option<String>),
+    /// No usable reply (timeout, transport error).
+    Failed,
+}
+
+fn record(db: &Path, found: &[(String, Lookup)], now: i64) -> Result<()> {
     let mut conn = connect(db)?;
     let tx = conn.transaction()?;
     {
@@ -166,8 +174,14 @@ fn record(db: &Path, found: &[(String, Option<String>)], now: i64) -> Result<()>
              SET name = ?2, origin = CASE WHEN ?2 IS NULL THEN NULL ELSE 'ptr' END, named_at = ?3
              WHERE ip = ?1 AND origin IS NOT 'config'",
         )?;
-        for (ip, name) in found {
-            put.execute(params![ip, name, now])?;
+        let mut touch = tx.prepare(
+            "UPDATE client_names SET named_at = ?2 WHERE ip = ?1 AND origin IS NOT 'config'",
+        )?;
+        for (ip, outcome) in found {
+            match outcome {
+                Lookup::Answer(name) => put.execute(params![ip, name, now])?,
+                Lookup::Failed => touch.execute(params![ip, now])?,
+            };
         }
     }
     tx.commit()?;
@@ -232,7 +246,10 @@ fn clean_name(ip: IpAddr, raw: &str) -> Option<String> {
             break;
         }
     }
-    (!name.is_empty()).then(|| name.to_string())
+    // The name ends up in the log and the API: printable ASCII only (this also rejects
+    // the backslash escapes `Name::to_ascii` writes for odd bytes), one DNS label long.
+    let printable = name.bytes().all(|b| (0x21..=0x7e).contains(&b)) && !name.contains('\\');
+    (printable && !name.is_empty() && name.len() <= 63 && !name.starts_with('.')).then(|| name.to_string())
 }
 
 #[cfg(test)]
@@ -355,7 +372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_timeout_is_recorded_like_no_answer() {
+    async fn a_timeout_leaves_name_null_and_sets_named_at() {
         let db = db_with("timeout", &["192.168.0.8"]);
         // A bound socket that never replies.
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -364,6 +381,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row(&db, "192.168.0.8"), (None, None, Some(T0)));
+    }
+
+    #[tokio::test]
+    async fn a_timeout_keeps_an_existing_ptr_name() {
+        let db = db_with("keep", &["192.168.0.13"]);
+        let (addr, _) = fake_router(Some("pc.lan.")).await;
+        devices(&db, addr).pass(T0).await.unwrap();
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let later = T0 + RETRY_AFTER_MS + 1;
+        devices(&db, silent.local_addr().unwrap())
+            .pass(later)
+            .await
+            .unwrap();
+        assert_eq!(
+            row(&db, "192.168.0.13"),
+            (Some("pc".into()), Some("ptr".into()), Some(later))
+        );
     }
 
     #[tokio::test]
@@ -419,8 +453,16 @@ mod tests {
             ("192.168.0.100", None),
             ("192.168.0.100.", None),
             (".", None),
+            (".lan.", None),
+            ("a\\.b.lan.", None),
+            ("caf\u{e9}.lan.", None),
+            ("with space.lan.", None),
             ("", None),
         ];
+        let long = format!("{}.lan.", "a".repeat(64));
+        assert_eq!(clean_name(a, &long), None);
+        let max = format!("{}.lan.", "a".repeat(63));
+        assert_eq!(clean_name(a, &max), Some("a".repeat(63)));
         for (raw, want) in cases {
             assert_eq!(clean_name(a, raw).as_deref(), want, "{raw:?}");
         }

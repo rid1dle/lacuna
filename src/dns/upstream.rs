@@ -664,8 +664,22 @@ mod tests {
         script: impl Fn(&Message) -> Vec<Vec<u8>> + Send + 'static,
         tcp_answer: Option<Message>,
     ) -> SocketAddr {
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = udp.local_addr().unwrap();
+        // The TCP listener must share the UDP port, which the OS picked: retry the pair
+        // when another socket already holds that TCP port.
+        let mut bound = None;
+        for _ in 0..20 {
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = udp.local_addr().unwrap();
+            if tcp_answer.is_none() {
+                bound = Some((udp, addr, None));
+                break;
+            }
+            if let Ok(tcp) = tokio::net::TcpListener::bind(addr).await {
+                bound = Some((udp, addr, Some(tcp)));
+                break;
+            }
+        }
+        let (udp, addr, tcp) = bound.expect("no free udp+tcp port pair");
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             while let Ok((n, from)) = udp.recv_from(&mut buf).await {
@@ -677,8 +691,7 @@ mod tests {
                 }
             }
         });
-        if let Some(answer) = tcp_answer {
-            let tcp = tokio::net::TcpListener::bind(addr).await.unwrap();
+        if let (Some(answer), Some(tcp)) = (tcp_answer, tcp) {
             tokio::spawn(async move {
                 while let Ok((mut s, _)) = tcp.accept().await {
                     let mut len = [0u8; 2];
