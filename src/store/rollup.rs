@@ -31,7 +31,8 @@ pub fn run(store: &Store, now_ms: i64) -> Result<()> {
 pub fn roll_up(store: &Store, now_ms: i64) -> Result<()> {
     let settled = now_ms - SETTLE_MS;
     // `unchecked_transaction` works through `&Connection`; nothing else uses this
-    // connection meanwhile, since only the writer thread holds it.
+    // connection meanwhile, since only the writer thread holds it. It begins IMMEDIATE
+    // (the connection's default, see `Store::open`) so it waits for a list refresh.
     let tx = store.conn.unchecked_transaction()?;
 
     let from = meta(&tx, ROLLED_HOURLY)?.unwrap_or(0);

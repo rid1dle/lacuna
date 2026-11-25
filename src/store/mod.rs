@@ -104,6 +104,11 @@ impl Store {
         conn.execute_batch(
             "PRAGMA synchronous = NORMAL; PRAGMA cache_size = -4096; PRAGMA foreign_keys = OFF;",
         )?;
+        // Every write transaction here starts with BEGIN IMMEDIATE. A DEFERRED one that
+        // reads first and must then upgrade to a write fails at once with "database is
+        // locked" when another connection (the list refresh) holds the lock; busy_timeout
+        // is not consulted for an upgrade, but it is for BEGIN IMMEDIATE.
+        conn.set_transaction_behavior(TransactionBehavior::Immediate);
         migrate(&mut conn).with_context(|| format!("migrating {}", path.display()))?;
         Ok(Store {
             conn,

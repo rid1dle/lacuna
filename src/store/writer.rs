@@ -329,6 +329,36 @@ mod tests {
             .unwrap()
     }
 
+    /// A list refresh holds the write lock for a moment. A DEFERRED transaction whose
+    /// first statement is a read fails at once when it must upgrade ("database is
+    /// locked", busy_timeout is not consulted); the log batch must wait instead.
+    #[test]
+    fn batch_waits_for_another_writer_instead_of_dropping() {
+        let db = TempDb::new("busy");
+        let (tx, mut w) = channel(Store::open(&db.0).unwrap(), 8);
+        tx.send(record(1, "10.0.0.1", "a.example"));
+        assert!(w.collect(Duration::ZERO));
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let path = db.0.clone();
+        let other = std::thread::spawn(move || {
+            let mut conn = rusqlite::Connection::open(path).unwrap();
+            let t = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            t.execute("INSERT INTO rule_texts (list_id, text) VALUES (1, 'x')", [])
+                .unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            t.commit().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        w.flush().unwrap();
+        other.join().unwrap();
+        assert_eq!(counter(&w.store, "log_dropped"), 0);
+        assert_eq!(count(&w.store, "raw_queries"), 1);
+    }
+
     #[test]
     fn full_channel_counts_drops() {
         let (tx, mut w) = channel(memory(), 2);

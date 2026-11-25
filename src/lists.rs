@@ -6,27 +6,30 @@
 //! rules already in force.
 //!
 //! Database writes use a short-lived second connection rather than the writer thread's.
-//! SQLite's WAL allows one writer at a time (busy_timeout 5s), so each transaction here
-//! is at most `RULE_CHUNK` rows: the query-log writer never waits more than a few ms.
+//! SQLite's WAL allows one writer at a time. Every write transaction on both connections
+//! begins IMMEDIATE, so a contender waits up to busy_timeout (5s) instead of failing at
+//! once, and each transaction here is at most `RULE_CHUNK` rows, so the query-log writer
+//! waits only milliseconds.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::future::Future;
+use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, RecordType};
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use tracing::{info, warn};
 
-use crate::config::{ListConfig, UpstreamConfig};
+use crate::config::ListConfig;
 use crate::dns::pipeline::Shared;
-use crate::dns::upstream::{client_builder, Remote, Upstream, Upstreams};
+use crate::dns::upstream::{client_builder, Upstream, Upstreams};
 use crate::rules::{parse_line, ListStats, Parsed, RuleSet};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,6 +40,8 @@ const RULE_CHUNK: usize = 5_000;
 /// First refresh after startup, then once a day.
 pub const FIRST_REFRESH: Duration = Duration::from_secs(5);
 pub const REFRESH_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// After a refresh where something failed, try again sooner than a day.
+pub const RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// Gets one list body. A trait so the refresh logic is tested without a network.
 pub trait Fetch: Send + Sync {
@@ -47,22 +52,16 @@ pub trait Fetch: Send + Sync {
 /// is sieve itself, so the host is resolved through sieve's own upstreams and pinned
 /// into the client.
 pub struct HttpFetcher<U: Upstream> {
-    ups: Upstreams<U>,
+    ups: Arc<Upstreams<U>>,
     max_bytes: usize,
 }
 
 impl<U: Upstream + 'static> HttpFetcher<U> {
-    pub fn new(ups: Upstreams<U>) -> Self {
+    pub fn new(ups: Arc<Upstreams<U>>) -> Self {
         HttpFetcher {
             ups,
             max_bytes: MAX_BODY_BYTES,
         }
-    }
-}
-
-impl HttpFetcher<Remote> {
-    pub fn from_config(cfg: &UpstreamConfig) -> Result<Self> {
-        Ok(Self::new(Upstreams::from_config(cfg)?))
     }
 }
 
@@ -95,12 +94,18 @@ impl<U: Upstream + 'static> Fetch for HttpFetcher<U> {
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("(no Location)");
-            return Err(format!("HTTP {} redirect to {to}, not followed", status.as_u16()));
+            return Err(format!(
+                "HTTP {} redirect to {to}, not followed",
+                status.as_u16()
+            ));
         }
         if !status.is_success() {
             return Err(format!("HTTP {}", status.as_u16()));
         }
-        let mut body = Vec::new();
+        let cap = resp
+            .content_length()
+            .map_or(0, |n| n.min(self.max_bytes as u64) as usize);
+        let mut body = Vec::with_capacity(cap);
         while let Some(chunk) = resp
             .chunk()
             .await
@@ -188,13 +193,34 @@ impl RefreshReport {
     }
 }
 
-pub struct Lists<F: Fetch> {
+/// How long to wait before the next refresh: an hour when any list failed (the lists
+/// are daily files, but a transient outage should not cost a day), else a day. A refresh
+/// with no error and `swapped == false` found nothing new, which is also a success.
+pub fn next_refresh_in(report: &RefreshReport) -> Duration {
+    if report.per_list.iter().any(|(_, r)| r.is_err()) {
+        RETRY_AFTER
+    } else {
+        REFRESH_EVERY
+    }
+}
+
+/// What the manager builds from; replaced as a whole by `set_config`.
+struct Conf {
     lists: Vec<ListConfig>,
     user_rules: Vec<String>,
+}
+
+pub struct Lists<F: Fetch> {
+    conf: RwLock<Arc<Conf>>,
     dir: PathBuf,
     db: PathBuf,
     rules: Shared<RuleSet>,
     fetcher: F,
+    /// One refresh at a time (the daily loop and a manual refresh may overlap).
+    refresh_lock: tokio::sync::Mutex<()>,
+    /// Stats of the build behind the live set; None until one succeeds and after
+    /// `set_config`, which makes the next refresh rebuild.
+    built: Mutex<Option<Vec<ListStats>>>,
 }
 
 impl<F: Fetch> Lists<F> {
@@ -207,29 +233,57 @@ impl<F: Fetch> Lists<F> {
         fetcher: F,
     ) -> Self {
         Lists {
-            lists,
-            user_rules,
+            conf: RwLock::new(Arc::new(Conf { lists, user_rules })),
             dir,
             db,
             rules,
             fetcher,
+            refresh_lock: tokio::sync::Mutex::new(()),
+            built: Mutex::new(None),
         }
     }
 
-    fn enabled(&self) -> impl Iterator<Item = &ListConfig> {
-        self.lists.iter().filter(|l| l.enabled)
+    /// Replaces the list configs and user rules (a config reload). Takes effect at the
+    /// next `sync_meta` / `refresh`, which rebuilds the set.
+    pub fn set_config(&self, lists: Vec<ListConfig>, user_rules: Vec<String>) {
+        *self.conf.write().unwrap_or_else(PoisonError::into_inner) =
+            Arc::new(Conf { lists, user_rules });
+        *self.built.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    fn conf(&self) -> Arc<Conf> {
+        Arc::clone(&self.conf.read().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Makes `list_meta` hold a row for every configured list, so the views never show a
-    /// NULL list name. Existing rows keep their fetch history.
+    /// NULL list name; existing rows keep their fetch history. Lists no longer configured
+    /// are marked disabled (the row stays, for labels in old log rows). A list whose URL
+    /// changed loses its last-good file: that body came from somewhere else.
     pub async fn sync_meta(&self) {
-        let rows: Vec<(u32, String, String, bool)> = self
+        let conf = self.conf();
+        let rows: Vec<(u32, String, String, bool)> = conf
             .lists
             .iter()
             .map(|l| (l.id, l.name.clone(), l.url.clone(), l.enabled))
             .collect();
+        let dir = self.dir.clone();
         self.db_run("list_meta upsert", move |conn| {
             let tx = conn.transaction()?;
+            let known: Vec<(u32, Option<String>)> = tx
+                .prepare("SELECT id, url FROM list_meta")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (id, old_url) in &known {
+                match rows.iter().find(|r| r.0 == *id) {
+                    None => {
+                        tx.execute("UPDATE list_meta SET enabled = 0 WHERE id = ?1", [id])?;
+                    }
+                    Some((_, _, url, _)) if old_url.as_deref().is_some_and(|u| u != url) => {
+                        let _ = std::fs::remove_file(dir.join(format!("{id}.txt")));
+                    }
+                    Some(_) => {}
+                }
+            }
             for (id, name, url, enabled) in rows {
                 tx.execute(
                     "INSERT INTO list_meta (id, name, url, enabled) VALUES (?1, ?2, ?3, ?4)
@@ -251,17 +305,21 @@ impl<F: Fetch> Lists<F> {
             lists = stats.len() - 1,
             "last good lists loaded"
         );
-        self.swap(set);
+        self.swap(set, stats);
         Ok(())
     }
 
     /// Fetches every enabled list, saves the bodies that are good, rebuilds from disk and
     /// swaps the set in. Failures are per list and recorded in `list_meta.last_error`.
+    /// When no body changed since the live build, the rebuild is skipped.
     pub async fn refresh(&self) -> RefreshReport {
+        let _one_at_a_time = self.refresh_lock.lock().await;
         // The status updates below need their rows; this is a few tiny upserts.
         self.sync_meta().await;
-        let mut outcomes: Vec<(u32, Result<(), String>)> = Vec::new();
-        for list in self.enabled() {
+        let conf = self.conf();
+
+        let mut outcomes: Vec<(u32, Result<bool, String>)> = Vec::new();
+        for list in conf.lists.iter().filter(|l| l.enabled) {
             let outcome = self.fetch_one(list).await;
             let (id, now) = (list.id, now_ms());
             let error = outcome.as_ref().err().cloned();
@@ -270,42 +328,80 @@ impl<F: Fetch> Lists<F> {
                     "UPDATE list_meta SET fetched_at = ?2, last_error = NULL WHERE id = ?1",
                     (id, now),
                 ),
-                Some(e) => conn.execute("UPDATE list_meta SET last_error = ?2 WHERE id = ?1", (id, e)),
+                Some(e) => conn.execute(
+                    "UPDATE list_meta SET last_error = ?2 WHERE id = ?1",
+                    (id, e),
+                ),
             })
             .await;
             outcomes.push((id, outcome));
         }
 
         let all_failed = !outcomes.is_empty() && outcomes.iter().all(|(_, o)| o.is_err());
-        let built = if all_failed {
-            Err(anyhow::anyhow!("every fetch failed"))
-        } else {
-            self.rebuild().await
-        };
-        match built {
+        let any_changed = outcomes.iter().any(|(_, o)| matches!(o, Ok(true)));
+        let current = self
+            .built
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if all_failed || (!any_changed && current.is_some()) {
+            // Nothing new to build from: the running set stays.
+            let stats = current.unwrap_or_default();
+            return RefreshReport {
+                per_list: outcomes
+                    .into_iter()
+                    .map(|(id, o)| match o {
+                        Err(e) => (id, Err(e)),
+                        Ok(_) => match stats.iter().find(|s| s.list_id == id) {
+                            Some(s) => (id, Ok(s.clone())),
+                            None => (id, Err("not in the running set".to_string())),
+                        },
+                    })
+                    .collect(),
+                swapped: false,
+            };
+        }
+
+        match self.rebuild().await {
             Ok((set, stats)) => {
-                self.swap(set);
                 self.store_stats(&stats).await;
                 let per_list = outcomes
                     .into_iter()
                     .map(|(id, o)| match o {
                         Err(e) => (id, Err(e)),
-                        Ok(()) => match stats.iter().find(|s| s.list_id == id) {
+                        Ok(_) => match stats.iter().find(|s| s.list_id == id) {
                             Some(s) => (id, Ok(s.clone())),
                             None => (id, Err("missing from the rebuilt set".to_string())),
                         },
                     })
                     .collect();
+                self.swap(set, stats);
                 RefreshReport {
                     per_list,
                     swapped: true,
                 }
             }
             Err(e) => {
-                if !all_failed {
-                    warn!("rule set rebuild failed, keeping the running set: {e:#}");
-                }
-                let reason = format!("{e:#}");
+                warn!("rule set rebuild failed, keeping the running set: {e:#}");
+                let reason = format!("rebuild failed: {e:#}");
+                // The fetch recorded success; the list is not in force, so say so.
+                let failed: Vec<u32> = outcomes
+                    .iter()
+                    .filter(|(_, o)| o.is_ok())
+                    .map(|(id, _)| *id)
+                    .collect();
+                let text = reason.clone();
+                self.db_run("list rebuild status", move |conn| {
+                    let tx = conn.transaction()?;
+                    for id in failed {
+                        tx.execute(
+                            "UPDATE list_meta SET last_error = ?2 WHERE id = ?1",
+                            (id, &text),
+                        )?;
+                    }
+                    tx.commit()
+                })
+                .await;
                 RefreshReport {
                     per_list: outcomes
                         .into_iter()
@@ -318,7 +414,8 @@ impl<F: Fetch> Lists<F> {
     }
 
     /// Fetches one list and saves it as the new last good body if it has any rules.
-    async fn fetch_one(&self, list: &ListConfig) -> Result<(), String> {
+    /// Ok(true) when the saved body changed.
+    async fn fetch_one(&self, list: &ListConfig) -> Result<bool, String> {
         let body = self.fetcher.fetch(&list.url).await?;
         let (dir, db, id) = (self.dir.clone(), self.db.clone(), list.id);
         // Parsing and file and database work are blocking; `body` is dropped inside.
@@ -328,34 +425,48 @@ impl<F: Fetch> Lists<F> {
     }
 
     /// User rules plus the last good body of every enabled list, bodies read from disk
-    /// and dropped as soon as the set is built.
+    /// and dropped as soon as the set is built. A file with no rules in it (damaged, or
+    /// an error page saved by an older build) is ignored with a warning.
     async fn rebuild(&self) -> Result<(RuleSet, Vec<ListStats>)> {
-        let ids: Vec<u32> = self.enabled().map(|l| l.id).collect();
-        let (dir, user) = (self.dir.clone(), self.user_rules.clone());
+        let conf = self.conf();
+        let dir = self.dir.clone();
         tokio::task::spawn_blocking(move || {
-            let bodies: Vec<(u32, String)> = ids
-                .into_iter()
-                .filter_map(|id| {
-                    match std::fs::read_to_string(dir.join(format!("{id}.txt"))) {
-                        Ok(body) => Some((id, body)),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(e) => {
-                            warn!(list = id, "reading last good body: {e}");
+            let bodies: Vec<(u32, String)> = conf
+                .lists
+                .iter()
+                .filter(|l| l.enabled)
+                .filter_map(
+                    |l| match std::fs::read_to_string(dir.join(format!("{}.txt", l.id))) {
+                        Ok(body) if has_rules(&body) => Some((l.id, body)),
+                        Ok(_) => {
+                            warn!(list = l.id, "last good file has no rules, ignoring it");
                             None
                         }
-                    }
-                })
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            warn!(list = l.id, "reading last good body: {e}");
+                            None
+                        }
+                    },
+                )
                 .collect();
             let refs: Vec<(u32, &str)> = bodies.iter().map(|(id, b)| (*id, b.as_str())).collect();
-            RuleSet::build(&user, &refs)
+            RuleSet::build(&conf.user_rules, &refs)
         })
         .await
         .context("rebuilding the rule set")
     }
 
-    fn swap(&self, set: RuleSet) {
-        // The lock is held only for this assignment; readers clone the inner Arc.
-        *self.rules.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(set);
+    fn swap(&self, set: RuleSet, stats: Vec<ListStats>) {
+        // Take the old set out under the lock but free it after: dropping a big set
+        // would otherwise hold up every query waiting to read the lock.
+        let old = {
+            let mut guard = self.rules.write().unwrap_or_else(PoisonError::into_inner);
+            std::mem::replace(&mut *guard, Arc::new(set))
+        };
+        *self.built.lock().unwrap_or_else(PoisonError::into_inner) = Some(stats);
+        // Freed on a blocking thread so the async worker does not stall on it.
+        drop(tokio::task::spawn_blocking(move || drop(old)));
     }
 
     async fn store_stats(&self, stats: &[ListStats]) {
@@ -404,10 +515,17 @@ impl<F: Fetch> Lists<F> {
     }
 }
 
+fn has_rules(body: &str) -> bool {
+    body.lines()
+        .any(|l| matches!(parse_line(l), Parsed::Rule(_)))
+}
+
 /// Saves `body` as list `id`'s last good copy. Err when it has no rules (an error page,
-/// an empty file). rule_texts are inserted only when the body differs from the saved one.
-fn persist(dir: &Path, db: &Path, id: u32, body: &str) -> Result<(), String> {
-    if !body.lines().any(|l| matches!(parse_line(l), Parsed::Rule(_))) {
+/// an empty file) or its rule texts cannot be saved (the file is then left alone, so the
+/// next refresh tries again). Ok(true) when the saved body changed; rule_texts are
+/// inserted only then.
+fn persist(dir: &Path, db: &Path, id: u32, body: &str) -> Result<bool, String> {
+    if !has_rules(body) {
         return Err(format!(
             "fetched body has no rules ({} bytes), keeping the previous list",
             body.len()
@@ -417,24 +535,26 @@ fn persist(dir: &Path, db: &Path, id: u32, body: &str) -> Result<(), String> {
     let unchanged = std::fs::metadata(&path).is_ok_and(|m| m.len() == body.len() as u64)
         && std::fs::read(&path).is_ok_and(|old| old == body.as_bytes());
     if unchanged {
-        return Ok(());
+        return Ok(false);
     }
-    // The rows go in before the file lands, so a crash in between retries next refresh.
-    match connect(db).and_then(|mut conn| insert_rule_texts(&mut conn, id, body)) {
-        Ok(()) => {}
-        Err(e) => warn!(list = id, "saving rule texts: {e}"),
-    }
+    connect(db)
+        .and_then(|mut conn| insert_rule_texts(&mut conn, id, body))
+        .map_err(|e| format!("saving rule texts: {e}"))?;
     std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    // Write beside, then rename: a crash mid-write never leaves half a list.
+    // Write beside, flush to disk, then rename: a crash never leaves half a list.
     let tmp = dir.join(format!("{id}.txt.tmp"));
-    std::fs::write(&tmp, body)
+    std::fs::File::create(&tmp)
+        .and_then(|mut f| f.write_all(body.as_bytes()).and_then(|()| f.sync_all()))
         .and_then(|()| std::fs::rename(&tmp, &path))
-        .map_err(|e| format!("writing {}: {e}", path.display()))
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(true)
 }
 
 fn connect(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_secs(5))?;
+    // See Store::open: IMMEDIATE waits for the lock, a DEFERRED upgrade fails at once.
+    conn.set_transaction_behavior(TransactionBehavior::Immediate);
     Ok(conn)
 }
 
@@ -452,10 +572,15 @@ fn insert_rule_texts(conn: &mut Connection, list_id: u32, body: &str) -> rusqlit
     insert_chunk(conn, list_id, &mut chunk)
 }
 
-fn insert_chunk(conn: &mut Connection, list_id: u32, chunk: &mut Vec<String>) -> rusqlite::Result<()> {
+fn insert_chunk(
+    conn: &mut Connection,
+    list_id: u32,
+    chunk: &mut Vec<String>,
+) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare("INSERT OR IGNORE INTO rule_texts (list_id, text) VALUES (?1, ?2)")?;
+        let mut stmt =
+            tx.prepare("INSERT OR IGNORE INTO rule_texts (list_id, text) VALUES (?1, ?2)")?;
         for text in chunk.drain(..) {
             stmt.execute((list_id, text))?;
         }
@@ -481,7 +606,6 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use crate::dns::pipeline::shared;
     use crate::dns::pipeline::testing::{upstreams, State};
     use crate::rules::Verdict;
@@ -490,6 +614,7 @@ mod tests {
     use rusqlite::OptionalExtension;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A fetcher serving canned bodies by URL, changeable between refreshes.
@@ -543,10 +668,7 @@ mod tests {
         let fetch = FakeFetch::default();
         let rules = shared(RuleSet::default());
         let lists = Lists::new(
-            vec![
-                cfg(1, "First", URL1, true),
-                cfg(2, "Second", URL2, false),
-            ],
+            vec![cfg(1, "First", URL1, true), cfg(2, "Second", URL2, false)],
             vec!["||user-blocked.test^".to_string()],
             dir.clone(),
             db.0.clone(),
@@ -586,7 +708,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_swaps_and_saves_last_good() {
         let r = rig("swap");
-        r.fetch.set(URL1, Ok("||adnet.com^\n||ads.net^\n! comment\n/re/\n"));
+        r.fetch
+            .set(URL1, Ok("||adnet.com^\n||ads.net^\n! comment\n/re/\n"));
         assert!(!r.blocks("adnet.com"));
 
         let report = r.lists.refresh().await;
@@ -620,13 +743,21 @@ mod tests {
             Some(2)
         );
 
-        // Same body again: nothing new is written.
+        // Same body again: nothing is written and nothing is rebuilt. Deleting a row first
+        // proves the insert is skipped, not merely ignored as a duplicate.
+        rusqlite::Connection::open(&r.db.0)
+            .unwrap()
+            .execute("DELETE FROM rule_texts WHERE text = '||ads.net^'", [])
+            .unwrap();
         let again = r.lists.refresh().await;
-        assert!(again.swapped);
+        assert!(!again.swapped);
+        let stats = again.per_list[0].1.as_ref().unwrap();
+        assert_eq!(stats.parsed, 2);
         assert_eq!(
             r.sql::<i64>("SELECT count(*) FROM rule_texts WHERE list_id = 1"),
-            Some(2)
+            Some(1)
         );
+        assert!(r.blocks("adnet.com"));
     }
 
     #[tokio::test]
@@ -711,6 +842,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_body_for_one_list_keeps_its_old_body_while_another_updates() {
+        let db = TempDb::new("mixed");
+        Store::open(&db.0).unwrap();
+        let dir = std::env::temp_dir().join(format!("sieve-lists-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fetch = FakeFetch::default();
+        let rules = shared(RuleSet::default());
+        let lists = Lists::new(
+            vec![cfg(1, "A", URL1, true), cfg(2, "B", URL2, true)],
+            vec![],
+            dir.clone(),
+            db.0.clone(),
+            Arc::clone(&rules),
+            fetch.clone(),
+        );
+        fetch.set(URL1, Ok("||old-one.test^\n"));
+        fetch.set(URL2, Ok("||old-two.test^\n"));
+        lists.refresh().await;
+
+        fetch.set(URL1, Ok("<html>502</html>"));
+        fetch.set(URL2, Ok("||new-two.test^\n"));
+        let report = lists.refresh().await;
+        assert!(report.swapped);
+        assert!(report.per_list[0].1.is_err() && report.per_list[1].1.is_ok());
+        let set = Arc::clone(&rules.read().unwrap());
+        let blocked = |n: &str| matches!(set.check(n), Verdict::Block { .. });
+        assert!(blocked("old-one.test"), "list 1 keeps its old body");
+        assert!(blocked("new-two.test") && !blocked("old-two.test"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn meta_rows_exist_before_any_fetch() {
         let r = rig("meta");
         r.lists.sync_meta().await;
@@ -727,8 +890,103 @@ mod tests {
             Some(URL2.to_string())
         );
         // A renamed list is updated, not duplicated.
+        r.lists.set_config(
+            vec![cfg(1, "Renamed", URL1, true), cfg(2, "Second", URL2, false)],
+            vec![],
+        );
         r.lists.sync_meta().await;
         assert_eq!(r.sql::<i64>("SELECT count(*) FROM list_meta"), Some(2));
+        assert_eq!(
+            r.sql::<String>("SELECT name FROM list_meta WHERE id = 1"),
+            Some("Renamed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_lists_are_disabled_and_moved_urls_lose_their_file() {
+        let r = rig("moved");
+        r.fetch.set(URL1, Ok("||adnet.com^\n"));
+        r.lists.refresh().await;
+        assert!(r.dir.join("1.txt").exists());
+
+        // List 2 leaves the config; list 1 now comes from another URL.
+        r.lists.set_config(
+            vec![cfg(1, "First", "https://other.test/1.txt", true)],
+            vec![],
+        );
+        r.lists.sync_meta().await;
+        assert!(!r.dir.join("1.txt").exists());
+        assert_eq!(
+            r.sql::<i64>("SELECT enabled FROM list_meta WHERE id = 2"),
+            Some(0)
+        );
+        assert_eq!(
+            r.sql::<String>("SELECT name FROM list_meta WHERE id = 2"),
+            Some("Second".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn config_change_forces_a_rebuild_even_when_bodies_match() {
+        let r = rig("reload");
+        r.fetch.set(URL1, Ok("||adnet.com^\n"));
+        r.lists.refresh().await;
+        r.lists.set_config(
+            vec![cfg(1, "First", URL1, true)],
+            vec!["||new-user.test^".to_string()],
+        );
+        let report = r.lists.refresh().await;
+        assert!(report.swapped);
+        assert!(r.blocks("new-user.test") && !r.blocks("user-blocked.test"));
+    }
+
+    #[tokio::test]
+    async fn rule_text_failure_leaves_the_last_good_file_alone() {
+        let r = rig("textfail");
+        let lists = Lists::new(
+            vec![cfg(1, "First", URL1, true)],
+            vec![],
+            r.dir.clone(),
+            r.dir.join("missing-dir/x.db"),
+            shared(RuleSet::default()),
+            r.fetch.clone(),
+        );
+        r.fetch.set(URL1, Ok("||adnet.com^\n"));
+        let report = lists.refresh().await;
+        assert!(report.per_list[0]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .contains("rule texts"));
+        assert!(!r.dir.join("1.txt").exists());
+    }
+
+    #[test]
+    fn failures_retry_in_an_hour_successes_in_a_day() {
+        let ok = (
+            1,
+            Ok(ListStats {
+                list_id: 1,
+                parsed: 1,
+                skipped: BTreeMap::new(),
+            }),
+        );
+        let bad = (2, Err("HTTP 502".to_string()));
+        let report = |per_list, swapped| RefreshReport { per_list, swapped };
+        assert_eq!(
+            next_refresh_in(&report(vec![ok.clone()], true)),
+            REFRESH_EVERY
+        );
+        // Nothing new (no rebuild) but no error: still a daily cadence.
+        assert_eq!(
+            next_refresh_in(&report(vec![ok.clone()], false)),
+            REFRESH_EVERY
+        );
+        assert_eq!(
+            next_refresh_in(&report(vec![ok, bad.clone()], true)),
+            RETRY_AFTER
+        );
+        assert_eq!(next_refresh_in(&report(vec![bad], false)), RETRY_AFTER);
     }
 
     #[test]
@@ -740,9 +998,11 @@ mod tests {
         insert_rule_texts(&mut conn, 1, &body).unwrap();
         insert_rule_texts(&mut conn, 1, &body).unwrap();
         let n: i64 = conn
-            .query_row("SELECT count(*) FROM rule_texts WHERE list_id = 1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT count(*) FROM rule_texts WHERE list_id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 12_345);
     }
@@ -782,13 +1042,16 @@ mod tests {
 
     fn fetcher() -> HttpFetcher<crate::dns::pipeline::testing::Fake> {
         let state = Arc::new(State::default());
-        HttpFetcher::new(upstreams(&state, Duration::from_millis(1)))
+        HttpFetcher::new(Arc::new(upstreams(&state, Duration::from_millis(1))))
     }
 
     #[tokio::test]
     async fn http_fetch_returns_the_body() {
         let url = serve(http("200 OK", "", "||adnet.com^\n")).await;
-        assert_eq!(fetcher().fetch(&url).await, Ok("||adnet.com^\n".to_string()));
+        assert_eq!(
+            fetcher().fetch(&url).await,
+            Ok("||adnet.com^\n".to_string())
+        );
     }
 
     #[tokio::test]
@@ -807,7 +1070,10 @@ mod tests {
         ))
         .await;
         let err = fetcher().fetch(&url).await.unwrap_err();
-        assert!(err.contains("301") && err.contains("https://elsewhere.test/x.txt"), "{err}");
+        assert!(
+            err.contains("301") && err.contains("https://elsewhere.test/x.txt"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -825,7 +1091,7 @@ mod tests {
         let ups = upstreams(&state, Duration::from_millis(1));
         let ip = resolve_host(&ups, "lists.example").await.unwrap();
         assert!(ip.is_ipv4());
-        assert_eq!(state.calls.load(Ordering::SeqCst) > 0, true);
+        assert!(state.calls.load(Ordering::SeqCst) > 0);
     }
 
     #[test]

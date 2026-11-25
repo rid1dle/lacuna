@@ -126,7 +126,7 @@ impl fmt::Display for FetchError {
 /// sits in its own `Arc` that each refresh task holds a clone of.
 struct Resolver<U: Upstream> {
     cache: Cache,
-    upstreams: Upstreams<U>,
+    upstreams: Arc<Upstreams<U>>,
     inflight: Semaphore,
     /// Keys with a background refresh running, so a busy stale name refreshes once.
     refreshing: Mutex<HashSet<CacheKey>>,
@@ -215,7 +215,8 @@ impl<U: Upstream + 'static> Pipeline<U> {
     pub fn new(
         rules: Shared<RuleSet>,
         live: Shared<LiveConfig>,
-        upstreams: Upstreams<U>,
+        // An `Arc` lets the list fetcher resolve through the same upstreams.
+        upstreams: impl Into<Arc<Upstreams<U>>>,
         max_inflight: usize,
     ) -> Self {
         Pipeline {
@@ -223,7 +224,7 @@ impl<U: Upstream + 'static> Pipeline<U> {
             live,
             resolver: Arc::new(Resolver {
                 cache: Cache::new(CACHE_ENTRIES),
-                upstreams,
+                upstreams: upstreams.into(),
                 inflight: Semaphore::new(max_inflight),
                 refreshing: Mutex::new(HashSet::new()),
             }),

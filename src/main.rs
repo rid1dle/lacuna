@@ -137,13 +137,14 @@ async fn serve_dns(config: &config::Config, log: Arc<dyn LogSink>) -> Result<()>
     // from disk (blocking is fine: nothing is listening yet).
     let (user_only, _) = rules::RuleSet::build(&config.user_rules, &[]);
     let rules = pipeline::shared(user_only);
+    let upstreams = Arc::new(Upstreams::from_config(&config.upstreams)?);
     let lists = Arc::new(Lists::new(
         config.lists.clone(),
         config.user_rules.clone(),
         config.store.lists_dir.clone(),
         config.store.path.clone(),
         Arc::clone(&rules),
-        HttpFetcher::from_config(&config.upstreams)?,
+        HttpFetcher::new(Arc::clone(&upstreams)),
     ));
     lists.sync_meta().await;
     if let Err(e) = lists.load_last_good().await {
@@ -153,7 +154,7 @@ async fn serve_dns(config: &config::Config, log: Arc<dyn LogSink>) -> Result<()>
     let pipeline = Arc::new(Pipeline::new(
         rules,
         pipeline::shared(LiveConfig::from_config(config)),
-        Upstreams::from_config(&config.upstreams)?,
+        upstreams,
         config.dns.max_inflight,
     ));
     let listeners = Listeners::bind(config.dns.listen).await?;
@@ -173,8 +174,9 @@ async fn serve_dns(config: &config::Config, log: Arc<dyn LogSink>) -> Result<()>
 async fn refresh_loop(lists: Arc<Lists<HttpFetcher<Remote>>>) {
     tokio::time::sleep(lists::FIRST_REFRESH).await;
     loop {
-        info!("{}", lists.refresh().await.summary());
-        tokio::time::sleep(lists::REFRESH_EVERY).await;
+        let report = lists.refresh().await;
+        info!("{}", report.summary());
+        tokio::time::sleep(lists::next_refresh_in(&report)).await;
     }
 }
 
