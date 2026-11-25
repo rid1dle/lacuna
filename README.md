@@ -95,7 +95,8 @@ folder, `lacuna/deploy/`.** Nothing here needs a `cd`.
    ```
    A second run is refused, because it would count every query twice.
    `--force` forgets the previous import and imports again (only into a fresh
-   database, or the history is doubled). It takes about a minute for 4.5M lines.
+   database, or the history is doubled). The shadow run imported 4,464,298 lines
+   in 68 s.
 7. Compare against AdGuard on real names, one per line in `names.txt` (in this
    folder). Do this after step 6:
    compare's queries land in AdGuard's log, and an import run afterwards would
@@ -112,15 +113,17 @@ folder, `lacuna/deploy/`.** Nothing here needs a `cd`.
 ## Shadow run results (2026-11-25)
 
 Measured on this server, lacuna on port 5300 next to the live AdGuard, with the
-AdGuard DNS filter (194,783 rules parsed, 22 regex rules skipped).
+AdGuard DNS filter (194,783 rules parsed, 22 regex rules skipped). Build: commit
+56a2f0b unless a row says otherwise.
 
 | Check | Result |
 |---|---|
 | History import | 4,464,298 AdGuard log lines: 1,716,701 kept raw (last 30 days), 2,747,597 into the hourly and daily counts only, 0 skipped. Rollups plus the raw tail equal the lines imported exactly. 68 s; slowest write batch 70 ms. |
-| Compare, 3,378 names from the last 24 h (A and AAAA) | 0 outcome differences. 932 answer differences, all CDN address rotation. 2 errors: one name timed out on both servers. |
-| Before the wildcard work | 64 outcome differences over 33 names, all from rule forms lacuna skipped (`*` inside a name, `\|` anchors, a leading dot). Over the imported window those forms decided 20,278 blocks lacuna would have missed and 1,065 allowed queries it would have blocked. |
-| Memory, process RSS | 45 MB after a fresh start; 55 MB with the DNS cache warm; 63 MB under DNS load plus two dashboard queries; 74 MB at the peak of a rule rebuild (list refresh or config reload). AdGuard: 81 MiB. The 40 MB target is not met yet: moving rule text out of memory is the next change. |
-| Dashboards | Every default panel answers over 1 and 30 days. Slowest at 30 days: cache hit % 0.74 s, top domains per device 0.59 s, all others under 0.3 s. Panels that read raw rows (cache hit %, upstream latency) cover at most the last 7 days: over 30 days they took 2.4 s alone and timed out when two ran under load. |
+| Compare, 3,378 names from the last 24 h (A and AAAA) | 0 outcome differences. 932 answer differences: 928 are CDN address rotation (724 different address sets, 204 overlapping), 4 are AAAA answers empty on one side only (Stripe and CloudFront names whose CNAME chains differ by resolver). 2 errors: one name timed out on both servers. |
+| Before the wildcard work (build 0292946) | 64 outcome differences over 33 names, all from rule forms lacuna skipped (`*` inside a name, `\|` anchors, a leading dot). Over the imported window AdGuard blocked 328,342 queries; those forms decided 20,769 blocks lacuna would have missed (6.3%) and 1,065 allowed queries it would have blocked. |
+| Memory, process RSS | 45 MB after a fresh start; 55 MB with the DNS cache warm; 66 MB under DNS load (3 compare streams) plus 4 concurrent 30-day dashboard queries; 75 MB at the peak of a rule rebuild (list refresh or config reload), settling at 56 MB. AdGuard: 81 MiB. The 40 MB target is not met yet: moving rule text out of memory is the next change. |
+| Disk | `lacuna.db` 244 MB after the import (1.7M raw rows, about 77 days of rollups); filter list copies 4.6 MB. |
+| Dashboards | Every default panel answers over 1 and 30 days. Slowest at 30 days, idle: cache hit % 0.74 s, top domains per device 0.59 s, all others under 0.3 s. Cache hit % and upstream latency read raw rows and cover at most the last 7 days: before that clamp, cache hit % over 30 days took 2.4 s alone and timed out (6 of 6) with two running under load. With 4 concurrent requests and 2 query slots, 2 get `429 busy`, as the contract specifies. |
 | API | 401 without the secret, 401 with a wrong one, 200 with it, from the `lacuna-api` network. |
 
 Not covered by the shadow run: real clients on port 53 (no device uses 5300),
@@ -151,6 +154,21 @@ Run from `lacuna/deploy/`, no `cd`. Not automated. When the comparison is clean 
 
 Note: after cutover, queries made on the server itself reach lacuna through
 docker-proxy and show a bridge IP as the client. LAN clients keep their own IP.
+
+First hour after cutover (the shadow run had no real clients, so this is the
+real load test). Until Sonder's dashboards exist, read the numbers through the
+API from the `lacuna-api` network (see `CONTRACT.md` for the call):
+
+- `SELECT name, value FROM counters`: `log_dropped` must stay 0, and
+  `queries_total` must keep rising.
+- `docker stats lacuna`: memory under about 75 MB (the shadow run's rebuild
+  peak); a steady climb past that is a reason to roll back.
+- Browse normally on a phone and a laptop. A site that breaks and works with
+  AdGuard is a rule difference: note the name, then check it with the
+  `test_domain` action.
+
+Keep AdGuard's container and data for 14 days after cutover, so Rollback stays
+one command. Remove them only after that, as a separate step.
 
 ## Rollback
 
