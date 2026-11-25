@@ -131,15 +131,23 @@ so the first hour after cutover is the real load test.
 
 ## Cutover (your step)
 
-Run from `lacuna/deploy/`, no `cd`. Not automated. When the comparison is clean and memory is under AdGuard's:
+Not automated. When the comparison is clean and memory is under AdGuard's:
 
-1. Prepare, with no downtime: edit `compose.yml`, changing the two port
-   lines from `5300` to `53` (`"53:5353/udp"`, `"53:5353/tcp"`), then
-   `docker compose config -q` (it prints nothing when the file is valid).
-2. Swap, back to back. `&&` means lacuna is only started if AdGuard stopped:
+1. Go to the folder (every later command assumes it) and switch the two port
+   lines from 5300 to 53. No downtime yet:
    ```bash
-   docker stop adguard && docker compose up -d
+   cd ~/homelab/lacuna/deploy
+   sed -i 's|"5300:5353/|"53:5353/|' compose.yml
+   grep -n '5353/' compose.yml     # both lines must now start "53:5353/
    ```
+2. Swap. AdGuard is stopped **only if** the compose file is valid and maps
+   port 53 twice, so a wrong folder or a missed edit leaves DNS untouched:
+   ```bash
+   docker compose config -q && [ "$(grep -c '"53:5353/' compose.yml)" = 2 ] \
+     && docker stop adguard && docker compose up -d
+   ```
+   If the line ends without printing `adguard`, AdGuard was never stopped and
+   is still serving: fix what it reported, then run step 2 again.
 3. Check. The server has no `dig`, so use lacuna's own `ask` there (exit 0
    means the answer matched `--expect`, exit 1 means it did not):
    ```bash
@@ -198,7 +206,7 @@ one command. Remove them only after that, as a separate step.
 
 ## Rollback
 
-Run from `lacuna/deploy/`, no `cd`.
+Works from any folder (container names only).
 
 1. Free port 53 and start AdGuard. **Starting AdGuard is what restores DNS.**
    Container names, not `docker compose`, so this works even if the port edit
@@ -209,8 +217,12 @@ Run from `lacuna/deploy/`, no `cd`.
    `;`, not `&&`: AdGuard must start whatever the first command says. Stopping
    an already stopped container exits 0, but a missing one (a failed `up` can
    leave none) exits 1, and `&&` would then skip AdGuard.
-2. Afterwards, with DNS back, change the two port lines in `compose.yml`
-   back to `5300`.
+2. Afterwards, with DNS back, put the ports back to 5300 and bring lacuna back
+   in shadow:
+   ```bash
+   cd ~/homelab/lacuna/deploy
+   sed -i 's|"53:5353/|"5300:5353/|' compose.yml && docker compose up -d
+   ```
 
 The data folder is kept, so lacuna can come back later with its history.
 
