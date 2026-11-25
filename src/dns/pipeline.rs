@@ -30,7 +30,8 @@ pub struct QueryRecord {
     /// Lowercase, without the trailing dot.
     pub name: String,
     pub qtype: u16,
-    pub rcode: u16,
+    /// `None` when unknown: only imported history whose answer did not decode.
+    pub rcode: Option<u16>,
     pub outcome: Outcome,
     pub reason: Reason,
     pub list_id: Option<u32>,
@@ -265,7 +266,7 @@ impl<U: Upstream + 'static> Pipeline<U> {
             client,
             name,
             qtype,
-            rcode: u16::from(resp.metadata.response_code),
+            rcode: Some(u16::from(resp.metadata.response_code)),
             outcome: d.outcome,
             reason: d.reason,
             list_id,
@@ -645,7 +646,7 @@ mod tests {
         assert_eq!(rec.rule.as_deref(), Some("||adnet.com^"));
         assert_eq!(rec.served_from, ServedFrom::Local);
         assert_eq!(rec.upstream, None);
-        assert_eq!(rec.rcode, 0);
+        assert_eq!(rec.rcode, Some(0));
         assert_eq!(rec.answers, vec![ip(0, 0, 0, 0)]);
         assert_eq!(state.calls(), 0);
     }
@@ -742,7 +743,7 @@ mod tests {
         assert_eq!(rec.outcome, Outcome::Refused);
         assert_eq!(rec.reason, Reason::AnyQuery);
         assert_eq!(rec.served_from, ServedFrom::Local);
-        assert_eq!(rec.rcode, 5);
+        assert_eq!(rec.rcode, Some(5));
         assert_eq!(state.calls(), 0);
     }
 
@@ -843,7 +844,7 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(2));
         assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
         assert_eq!(resp.metadata.id, 0x4242);
-        assert_eq!(rec.rcode, 2);
+        assert_eq!(rec.rcode, Some(2));
         assert_eq!(rec.outcome, Outcome::Allowed);
         assert_eq!(rec.served_from, ServedFrom::Upstream);
         assert_eq!(rec.upstream, None);
@@ -915,7 +916,7 @@ mod tests {
             assert_eq!(resp.metadata.response_code, ResponseCode::NotImp);
             assert_eq!(resp.metadata.id, 0x4242);
             assert_eq!(resp.metadata.op_code, OpCode::Update);
-            assert_eq!(rec.rcode, 4);
+            assert_eq!(rec.rcode, Some(4));
             assert_eq!(rec.outcome, Outcome::Refused);
             assert_eq!(rec.served_from, ServedFrom::Local);
         }
@@ -946,7 +947,7 @@ mod tests {
         let (resp, rec) = p.handle(q, CLIENT).await;
         assert_eq!(resp.metadata.response_code, ResponseCode::FormErr);
         assert_eq!(resp.metadata.id, 0x4242);
-        assert_eq!(rec.rcode, 1);
+        assert_eq!(rec.rcode, Some(1));
         assert_eq!(state.calls(), 0);
     }
 }

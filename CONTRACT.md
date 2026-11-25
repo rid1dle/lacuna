@@ -160,6 +160,11 @@ Conventions in the views:
   relabels its history.
 - `list_id` 0 is the user rules from lacuna's config, named `user rules`.
 - `answers` is the A/AAAA addresses sent, comma separated, `''` when there were none.
+- `rcode` is NULL when the response code is unknown: only imported AdGuard history
+  whose stored answer could not be decoded (`source` `adguard`). Count by
+  `rcode IS NULL` rather than reading it as NOERROR.
+- `upstream` names the upstream that answered. It is NULL for cache hits and local
+  answers (imported history included) and when no upstream answered.
 
 **Never create views in lacuna's database.** At every start lacuna drops every view in
 the database file, its own and any other, and recreates its own. A view added by

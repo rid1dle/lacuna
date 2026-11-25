@@ -144,6 +144,14 @@ impl Store {
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
     }
+
+    /// Writes rows as the live writer would, without its thread.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, records: &[crate::dns::pipeline::QueryRecord]) {
+        let tx = self.conn.transaction().expect("test transaction");
+        writer::insert_batch(&tx, records, Source::Lacuna).expect("test insert");
+        tx.commit().expect("test commit");
+    }
 }
 
 /// No `meta` table: a new database, so create the tables. Version 1: keep them. Anything
@@ -308,7 +316,7 @@ pub(crate) mod testing {
             client: client.parse().expect("test ip"),
             name: name.to_string(),
             qtype: 1,
-            rcode: 0,
+            rcode: Some(0),
             outcome: Outcome::Allowed,
             reason: Reason::None,
             list_id: None,
@@ -553,11 +561,14 @@ mod tests {
     #[test]
     fn rcode_labels() {
         let mut store = memory();
-        let codes = [0u16, 1, 2, 3, 4, 5, 99];
+        // None: unknown, which only imported history can be.
+        let codes = [0u16, 1, 2, 3, 4, 5, 99]
+            .map(Some)
+            .into_iter()
+            .chain([None]);
         let records: Vec<_> = codes
-            .iter()
             .enumerate()
-            .map(|(i, &rcode)| {
+            .map(|(i, rcode)| {
                 let mut r = record(i as i64, "10.0.0.1", "a.example");
                 r.rcode = rcode;
                 r
@@ -570,15 +581,20 @@ mod tests {
             .conn
             .prepare("SELECT rcode FROM queries ORDER BY ts")
             .unwrap();
-        let got: Vec<String> = stmt
+        let got: Vec<Option<String>> = stmt
             .query_map([], |r| r.get(0))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(
-            got,
-            ["NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED", "RCODE99"]
-        );
+        let want = [
+            "NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED", "RCODE99",
+        ];
+        let want: Vec<Option<String>> = want
+            .iter()
+            .map(|l| Some(l.to_string()))
+            .chain([None])
+            .collect();
+        assert_eq!(got, want);
     }
 
     /// Every enum label comes back through the views; a variant added to codes.rs but

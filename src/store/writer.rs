@@ -235,9 +235,16 @@ pub fn import_batch(
     let before = insert_rows(&tx, records, Source::Adguard)?;
     let rolled_up_only = rollup::roll_and_drop_old(&tx, before, raw_from_ms)?;
     rollup::roll_late(&tx, before)?;
+    // Counted in the table, not derived from the batch length, so the import's
+    // `lines == raw + rolled_up_only + skipped` check sees a row that went missing.
+    let raw: i64 = tx.query_row(
+        "SELECT count(*) FROM raw_queries WHERE rowid > ?1",
+        [before],
+        |r| r.get(0),
+    )?;
     tx.commit()?;
     Ok(ImportedBatch {
-        raw: records.len() as u64 - rolled_up_only,
+        raw: u64::try_from(raw).unwrap_or(0),
         rolled_up_only,
         held: locked.elapsed(),
     })

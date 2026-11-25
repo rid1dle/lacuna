@@ -4,7 +4,7 @@
 //! Rollups read raw rows not yet rolled up: `meta.rolled_hourly_until` and
 //! `meta.rolled_daily_until` hold the end (exclusive, unix ms) of what has been counted.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{Store, DAY_MS, HOUR_MS, IST_OFFSET_MS};
@@ -20,7 +20,8 @@ const DELETE_CHUNK: usize = 10_000;
 const ROLLED_HOURLY: &str = "rolled_hourly_until";
 const ROLLED_DAILY: &str = "rolled_daily_until";
 
-/// Rollups, then retention. The writer thread calls the two on their own schedules.
+/// Rollups, then retention, as the writer thread runs them on their own schedules.
+#[cfg(test)]
 pub fn run(store: &Store, now_ms: i64) -> Result<()> {
     roll_up(store, now_ms)?;
     retain(store, now_ms)
@@ -72,15 +73,24 @@ pub(super) fn roll_late(conn: &Connection, after_rowid: i64) -> Result<u64> {
 /// Imported history older than the raw window: rows inserted after `after_rowid` with
 /// `ts < before` are added to both rollups whatever the marks say (no scheduled rollup
 /// will ever see them), then deleted from raw_queries. Runs in the inserting
-/// transaction. Returns how many there were.
+/// transaction. Returns how many rows were rolled up, failing if a different number
+/// was deleted.
 pub(super) fn roll_and_drop_old(conn: &Connection, after_rowid: i64, before: i64) -> Result<u64> {
+    let rolled: i64 = conn.query_row(
+        &format!("SELECT count(*) FROM raw_queries WHERE {LATE}"),
+        params![after_rowid, before],
+        |r| r.get(0),
+    )?;
     roll_hourly(conn, LATE, after_rowid, before)?;
     roll_daily(conn, LATE, after_rowid, before)?;
-    let n = conn.execute(
+    let deleted = conn.execute(
         &format!("DELETE FROM raw_queries WHERE {LATE}"),
         params![after_rowid, before],
     )?;
-    Ok(n as u64)
+    if usize::try_from(rolled).ok() != Some(deleted) {
+        bail!("rolled up {rolled} old rows but deleted {deleted}");
+    }
+    Ok(deleted as u64)
 }
 
 /// Raw rows a rollup reads: a `ts` range (the scheduled rollup, through the ts index),

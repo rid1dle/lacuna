@@ -45,15 +45,22 @@ pub struct ImportReport {
     pub rolled_up_only: u64,
     /// Lines not imported, by reason.
     pub skipped: BTreeMap<String, u64>,
-    /// Imported rows whose answer could not be decoded: kept with no addresses and
-    /// rcode 0 (the column cannot be empty).
+    /// Imported rows whose answer could not be decoded: kept with no addresses and a
+    /// NULL rcode (unknown).
     pub answer_undecodable: u64,
     /// The longest any one batch held the write lock.
     pub slowest_batch: Duration,
+    /// Rows from this time (unix ms) on stay raw; older ones only add to the rollups.
+    pub raw_from_ms: i64,
 }
 
 impl fmt::Display for ImportReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "raw from        unix ms {} (older rows only add to the rollups)",
+            self.raw_from_ms
+        )?;
         writeln!(f, "lines           {}", self.lines)?;
         writeln!(f, "raw             {}", self.raw)?;
         writeln!(f, "rolled up only  {}", self.rolled_up_only)?;
@@ -172,7 +179,10 @@ fn import_in_batches(
     rollup::roll_up(store, now_ms)?;
     let raw_from = now_ms - i64::from(raw_days) * DAY_MS;
 
-    let mut report = ImportReport::default();
+    let mut report = ImportReport {
+        raw_from_ms: raw_from,
+        ..ImportReport::default()
+    };
     let mut batch = Vec::with_capacity(batch_rows);
     let mut buf = Vec::new();
     let mut last_commit = None;
@@ -198,7 +208,9 @@ fn import_in_batches(
         }
     }
     write(store, &mut batch, raw_from, &mut report, &mut last_commit)?;
-    rollup::run(store, now_ms)?;
+    // Rolls up what closed during the import. No retention here: pruning is serve's,
+    // on its own schedule and with the deployed config's retention.
+    rollup::roll_up(store, now_ms)?;
 
     let skipped: u64 = report.skipped.values().sum();
     ensure!(
@@ -269,7 +281,10 @@ fn parse_line(bytes: &[u8]) -> Result<(QueryRecord, bool), Skip> {
 
     let decoded = decode_answer(&line.answer);
     let decoded_ok = decoded.is_some();
-    let (rcode, answers) = decoded.unwrap_or_default();
+    let (rcode, answers) = match decoded {
+        Some((rcode, answers)) => (Some(rcode), answers),
+        None => (None, Vec::new()),
+    };
     let (list_id, rule) = rule.unzip();
     let record = QueryRecord {
         ts_ms,
@@ -282,7 +297,11 @@ fn parse_line(bytes: &[u8]) -> Result<(QueryRecord, bool), Skip> {
         list_id,
         rule,
         served_from,
-        upstream: Some(line.upstream).filter(|u| !u.is_empty()),
+        // AdGuard also names an upstream on cache hits (the one that filled the cache)
+        // and on blocks found in a cached answer. In lacuna the column is the upstream
+        // asked for this query, so it is kept only when one was.
+        upstream: Some(line.upstream)
+            .filter(|u| served_from == ServedFrom::Upstream && !u.is_empty()),
         latency_us: u32::try_from(line.elapsed / 1000).unwrap_or(u32::MAX),
         answers,
     };
@@ -389,7 +408,7 @@ mod tests {
     use rusqlite::types::FromSql;
 
     use super::*;
-    use crate::store::testing::TempDb;
+    use crate::store::testing::{record, TempDb};
     use crate::store::{rollup, DAY_MS, HOUR_MS};
 
     /// 2026-11-25 00:00 IST. With 30 raw days the cut is 2026-10-26 00:00 IST.
@@ -498,12 +517,14 @@ mod tests {
         assert_eq!(
             rows,
             vec![
+                // AdGuard names an upstream on cache hits and on blocks found in a
+                // cached answer; lacuna names one only when it was asked.
                 (
                     s("www.example.org"),
                     s("allowed"),
                     s("none"),
                     None,
-                    up(),
+                    None,
                     s("cache")
                 ),
                 (
@@ -527,7 +548,7 @@ mod tests {
                     s("blocked"),
                     s("cname"),
                     Some(s("||cdn.tracker.example^")),
-                    up(),
+                    None,
                     s("local")
                 ),
                 (
@@ -638,18 +659,36 @@ mod tests {
             report.lines,
             report.raw + report.rolled_up_only + report.skipped.values().sum::<u64>()
         );
-        // The undecodable answer: imported, with no addresses.
-        let row: (String, String, String) = store
+        // The undecodable answer: imported, with no addresses and no rcode (unknown,
+        // not NOERROR).
+        let row: (String, String, String, Option<String>) = store
             .conn()
             .query_row(
-                "SELECT type, answers, outcome FROM queries WHERE domain = 'nx.example'",
+                "SELECT type, answers, outcome, rcode FROM queries WHERE domain = 'nx.example'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(row, ("HTTPS".into(), "".into(), "allowed".into()));
+        assert_eq!(row, ("HTTPS".into(), "".into(), "allowed".into(), None));
         let raw: i64 = one(&store, "SELECT count(*) FROM raw_queries");
         assert_eq!(raw, 6);
+    }
+
+    /// Pruning is serve's job, with the deployed retention; the import's own raw_days
+    /// only decides which rows stay raw, and the report says where that cut fell.
+    #[test]
+    fn import_does_not_prune() {
+        let mut store = memory();
+        let old = record(NOW - 40 * DAY_MS, "10.9.0.9", "kept.example");
+        store.insert_for_test(&[old]);
+        let report = sample(&store);
+        let kept: i64 = one(
+            &store,
+            "SELECT count(*) FROM queries WHERE domain = 'kept.example'",
+        );
+        assert_eq!(kept, 1, "a raw row older than the window is left to serve");
+        assert_eq!(report.raw_from_ms, CUT);
+        assert!(report.to_string().contains(&CUT.to_string()), "{report}");
     }
 
     #[test]

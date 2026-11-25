@@ -51,12 +51,13 @@ CREATE TABLE client_names (
 );
 
 -- answers: A/AAAA addresses joined by commas; '' when the response had none.
+-- rcode: NULL when unknown (imported history whose answer could not be decoded).
 CREATE TABLE raw_queries (
     ts          INTEGER NOT NULL,
     client      TEXT NOT NULL,
     domain_id   INTEGER NOT NULL,
     qtype       INTEGER NOT NULL,
-    rcode       INTEGER NOT NULL,
+    rcode       INTEGER,
     outcome     INTEGER NOT NULL,
     reason      INTEGER NOT NULL,
     rule_id     INTEGER,

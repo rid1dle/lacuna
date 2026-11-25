@@ -272,7 +272,7 @@ fn schema() -> Vec<View> {
                 col(
                     "rcode",
                     "text",
-                    "Response code: NOERROR, NXDOMAIN, ... or RCODE<n>",
+                    "Response code: NOERROR, NXDOMAIN, ... or RCODE<n>; NULL when unknown",
                 ),
                 col("outcome", "text", "allowed, blocked, rewritten or refused"),
                 col(
