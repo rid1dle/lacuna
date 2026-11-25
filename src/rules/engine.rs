@@ -1,11 +1,13 @@
-//! The rule set: every list's rules in one map, queried by walking a name's suffixes.
+//! The rule set: every list's rules in one map, queried by walking a name's suffixes, plus a
+//! small pattern table for the rules a suffix lookup cannot express.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use super::{parse_line, Parsed, Rule, RuleKind};
+use super::pattern::PatternTable;
+use super::{parse_line, Parsed, Rule, RuleKind, Target};
 
 /// What the rules say about one name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +47,28 @@ struct Origin {
 /// 1-based index into `RuleSet::origins`; `None` costs nothing extra thanks to the niche.
 type Slot = Option<NonZeroU32>;
 
+/// The four precedence classes of block and allow rules, strongest first.
+#[derive(Debug, Clone, Copy)]
+enum Class {
+    ImportantAllow,
+    ImportantBlock,
+    Allow,
+    Block,
+}
+
+impl Class {
+    /// None for hosts IPs: they live in `RuleSet::hosts_ip`, below every class.
+    fn of(kind: &RuleKind, important: bool) -> Option<Class> {
+        match (kind, important) {
+            (RuleKind::Allow, true) => Some(Class::ImportantAllow),
+            (RuleKind::Block, true) => Some(Class::ImportantBlock),
+            (RuleKind::Allow, false) => Some(Class::Allow),
+            (RuleKind::Block, false) => Some(Class::Block),
+            (RuleKind::HostsIp(_), _) => None,
+        }
+    }
+}
+
 /// The strongest rule of each class for one exact domain (first loaded wins a tie).
 /// Four 4-byte indices instead of owned rule text keeps a 200k-domain table small.
 #[derive(Debug, Default)]
@@ -56,16 +80,15 @@ struct Entry {
 }
 
 impl Entry {
-    fn insert(&mut self, kind: &RuleKind, important: bool, index: NonZeroU32) {
-        let slot = match (kind, important) {
-            (RuleKind::Allow, true) => &mut self.important_allow,
-            (RuleKind::Block, true) => &mut self.important_block,
-            (RuleKind::Allow, false) => &mut self.allow,
-            (RuleKind::Block, false) => &mut self.block,
-            // Hosts IPs never reach an Entry; they live in `RuleSet::hosts_ip`.
-            (RuleKind::HostsIp(_), _) => return,
+    /// Indices grow in load order, so the smallest is the first loaded (user rules first).
+    fn keep_first(&mut self, class: Class, index: NonZeroU32) {
+        let slot = match class {
+            Class::ImportantAllow => &mut self.important_allow,
+            Class::ImportantBlock => &mut self.important_block,
+            Class::Allow => &mut self.allow,
+            Class::Block => &mut self.block,
         };
-        slot.get_or_insert(index);
+        *slot = Some(slot.map_or(index, |old| old.min(index)));
     }
 }
 
@@ -79,6 +102,8 @@ pub struct RuleSet {
     exact_block: HashMap<Box<str>, NonZeroU32>,
     /// Hosts-syntax lines with a real IP: the exact name only. Rare, so a plain map.
     hosts_ip: HashMap<Box<str>, (IpAddr, NonZeroU32)>,
+    /// Wildcards, `|` anchors and unanchored text: a few hundred, compiled once here.
+    patterns: PatternTable<(Class, NonZeroU32)>,
     count: usize,
 }
 
@@ -146,11 +171,10 @@ impl RuleSet {
         let mut set = RuleSet::default();
         for (list_id, rule) in rules {
             let Rule {
-                domain,
+                target,
                 kind,
                 important,
                 badfilter,
-                exact_only,
                 text,
             } = rule;
             if badfilter || by_user.contains(&text) || (list_id != 0 && by_lists.contains(&text)) {
@@ -165,19 +189,29 @@ impl RuleSet {
             let Some(index) = NonZeroU32::new(set.origins.len() as u32) else {
                 continue;
             };
-            let key = domain.into_boxed_str();
-            match (&kind, exact_only) {
-                (RuleKind::HostsIp(ip), _) => {
-                    set.hosts_ip.entry(key).or_insert((*ip, index));
+            let class = Class::of(&kind, important);
+            match (target, kind, class) {
+                (Target::Exact(name), RuleKind::HostsIp(ip), _) => {
+                    set.hosts_ip
+                        .entry(name.into_boxed_str())
+                        .or_insert((ip, index));
                 }
-                (_, true) => {
-                    set.exact_block.entry(key).or_insert(index);
+                // The parser makes exact targets only for hosts lines, so this is a block.
+                (Target::Exact(name), _, _) => {
+                    set.exact_block
+                        .entry(name.into_boxed_str())
+                        .or_insert(index);
                 }
-                (_, false) => set
+                (Target::Suffix(domain), _, Some(class)) => set
                     .suffix
-                    .entry(key)
+                    .entry(domain.into_boxed_str())
                     .or_default()
-                    .insert(&kind, important, index),
+                    .keep_first(class, index),
+                (Target::Pattern(pattern), _, Some(class)) => {
+                    set.patterns.insert(pattern, (class, index));
+                }
+                // No class means a hosts IP, and the parser gives those exact targets only.
+                (Target::Suffix(_) | Target::Pattern(_), _, None) => {}
             }
         }
         (set, stats)
@@ -199,6 +233,7 @@ impl RuleSet {
                 * (std::mem::size_of::<(Box<str>, (IpAddr, NonZeroU32))>() + 1)
             + self.origins.capacity() * std::mem::size_of::<Origin>()
             + self.origins.iter().map(|o| o.rule.len()).sum::<usize>()
+            + self.patterns.estimated_bytes()
     }
 
     fn verdict(&self, index: NonZeroU32, make: impl FnOnce(u32, Arc<str>) -> Verdict) -> Verdict {
@@ -210,18 +245,15 @@ impl RuleSet {
     }
 
     /// Precedence (AdGuard): important allow, important block, allow, block, hosts IP.
-    /// `||example.com^` and plain domains cover every subdomain, so each suffix of the name is
-    /// looked up; hosts-syntax lines match the exact name only.
-    ///
-    /// Plain domain-only lines are treated like `||domain^` (subdomains included). AdGuard's
-    /// syntax page (adguard-dns.io/kb/general/dns-filtering-syntax) does not say, so this is
-    /// unconfirmed against urlfilter.
+    /// `||example.com^` covers every subdomain, so each suffix of the name is looked up;
+    /// hosts lines and lines that are only a host name match the exact name. Pattern rules
+    /// join the same classes; within a class a suffix hit is reported before a pattern hit.
     pub fn check(&self, name: &str) -> Verdict {
         // The one allocation: ASCII lowercase of the name, minus a trailing dot.
         let lowered = name.to_ascii_lowercase();
         let full = lowered.strip_suffix('.').unwrap_or(&lowered);
 
-        let (mut imp_block, mut allow, mut block): (Slot, Slot, Slot) = (None, None, None);
+        let mut hit = Entry::default();
         let mut suffix = full;
         loop {
             if let Some(entry) = self.suffix.get(suffix) {
@@ -229,18 +261,28 @@ impl RuleSet {
                     return self.verdict(i, |list_id, rule| Verdict::Allow { list_id, rule });
                 }
                 // The most specific suffix to hit a class wins that class.
-                imp_block = imp_block.or(entry.important_block);
-                allow = allow.or(entry.allow);
-                block = block.or(entry.block);
+                hit.important_block = hit.important_block.or(entry.important_block);
+                hit.allow = hit.allow.or(entry.allow);
+                hit.block = hit.block.or(entry.block);
             }
             match suffix.split_once('.') {
                 Some((_, parent)) => suffix = parent,
                 None => break,
             }
         }
-        block = block.or_else(|| self.exact_block.get(full).copied());
+        hit.block = hit.block.or_else(|| self.exact_block.get(full).copied());
 
-        if let Some(i) = imp_block {
+        let mut by_pattern = Entry::default();
+        self.patterns
+            .for_each_match(full, |&(class, i)| by_pattern.keep_first(class, i));
+        let imp_allow = by_pattern.important_allow;
+        let imp_block = hit.important_block.or(by_pattern.important_block);
+        let allow = hit.allow.or(by_pattern.allow);
+        let block = hit.block.or(by_pattern.block);
+
+        if let Some(i) = imp_allow {
+            self.verdict(i, |list_id, rule| Verdict::Allow { list_id, rule })
+        } else if let Some(i) = imp_block {
             self.verdict(i, |list_id, rule| Verdict::Block { list_id, rule })
         } else if let Some(i) = allow {
             self.verdict(i, |list_id, rule| Verdict::Allow { list_id, rule })
@@ -393,6 +435,145 @@ mod tests {
         assert!(matches!(set.check("ads.x.com"), Verdict::Allow { .. }));
     }
 
+    fn is_allow(v: &Verdict) -> bool {
+        matches!(v, Verdict::Allow { .. })
+    }
+
+    // The rule texts below are real lines from the AdGuard DNS filter that the shadow
+    // compare found lacuna skipping.
+
+    #[test]
+    fn wildcard_at_host_start() {
+        let (set, _) = build(&[], &[(1, "||*cdn-settings.appsflyersdk.com^")]);
+        assert_eq!(
+            set.check("kz4tx3-cdn-settings.appsflyersdk.com"),
+            Verdict::Block {
+                list_id: 1,
+                rule: "||*cdn-settings.appsflyersdk.com^".into()
+            }
+        );
+        assert!(is_block(&set.check("9m71lc.cdn-settings.appsflyersdk.com")));
+        assert_eq!(
+            set.check("cdn-settings.appsflyersdk.com.evil"),
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn wildcard_as_tld() {
+        let (set, _) = build(&[], &[(1, "||aan.amazon.*^")]);
+        assert!(is_block(&set.check("aan.amazon.in")));
+        assert!(is_block(&set.check("x.aan.amazon.co.uk")));
+        assert_eq!(set.check("xaan.amazon.in"), Verdict::Pass);
+    }
+
+    #[test]
+    fn wildcard_mid_name() {
+        let (set, _) = build(&[], &[(1, "||mobileanalytics.*.amazonaws.com^")]);
+        assert!(is_block(
+            &set.check("mobileanalytics.us-east-1.amazonaws.com")
+        ));
+        assert_eq!(set.check("mobileanalytics.amazonaws.com"), Verdict::Pass);
+        let (set, _) = build(&[], &[(1, "||sdk-*.moengage.com^")]);
+        assert!(is_block(&set.check("sdk-01.moengage.com")));
+        assert_eq!(set.check("moengage.com"), Verdict::Pass);
+    }
+
+    #[test]
+    fn leading_dot_needs_a_label_before_it() {
+        let (set, _) = build(&[], &[(1, ".skadsdkless.appsflyersdk.com^")]);
+        assert!(is_block(&set.check("neqm8i.skadsdkless.appsflyersdk.com")));
+        assert_eq!(set.check("skadsdkless.appsflyersdk.com"), Verdict::Pass);
+    }
+
+    #[test]
+    fn domain_anchor_with_trailing_pipe_allows() {
+        let (set, _) = build(
+            &[],
+            &[(1, "||googleadservices.com^\n@@||www.googleadservices.com^|")],
+        );
+        assert_eq!(
+            set.check("www.googleadservices.com"),
+            Verdict::Allow {
+                list_id: 1,
+                rule: "@@||www.googleadservices.com^|".into()
+            }
+        );
+        assert!(is_block(&set.check("googleadservices.com")));
+    }
+
+    #[test]
+    fn start_anchor_allows_the_exact_name_only() {
+        let (set, _) = build(&[], &[(1, "||taboola.com^\n@@|cdn.taboola.com^|")]);
+        assert!(is_allow(&set.check("cdn.taboola.com")));
+        assert!(is_block(&set.check("x.cdn.taboola.com")));
+    }
+
+    #[test]
+    fn wildcard_rules_share_precedence() {
+        let (set, _) = build(&[], &[(1, "||*ads.example^$important\n@@||x.ads.example^")]);
+        assert!(is_block(&set.check("x.ads.example")));
+        let (set, _) = build(&[], &[(1, "@@||*.cdn.example^\n||x.cdn.example^")]);
+        assert!(is_allow(&set.check("x.cdn.example")));
+        // An important allow pattern beats an important suffix block.
+        let (set, _) = build(
+            &[],
+            &[(1, "||cdn.example^$important\n@@|*.cdn.example^$important")],
+        );
+        assert!(is_allow(&set.check("x.cdn.example")));
+        assert!(is_block(&set.check("cdn.example")));
+    }
+
+    #[test]
+    fn domain_anchor_without_separator_is_a_prefix() {
+        // `||an.yandex.` is a label run followed by anything, not the name `an.yandex`.
+        let (set, _) = build(&[], &[(1, "||an.yandex.")]);
+        assert!(is_block(&set.check("an.yandex.ru")));
+        assert!(is_block(&set.check("x.an.yandex.com")));
+        assert_eq!(set.check("an.yandex"), Verdict::Pass);
+        assert_eq!(set.check("xan.yandex.ru"), Verdict::Pass);
+        let (set, _) = build(&[], &[(1, "||direct-specific.com")]);
+        assert!(is_block(&set.check("direct-specific.com")));
+        assert!(is_block(&set.check("a.direct-specific.com.au")));
+        assert_eq!(set.check("notdirect-specific.com"), Verdict::Pass);
+    }
+
+    #[test]
+    fn unanchored_line_matches_anywhere() {
+        let (set, _) = build(&[], &[(1, "-ads1.\n-ad123-")]);
+        assert!(is_block(&set.check("foo-ads1.example.com")));
+        assert!(is_block(&set.check("x-ad123-y.example.com")));
+        assert_eq!(set.check("ads1.example.com"), Verdict::Pass);
+    }
+
+    #[test]
+    fn plain_domain_line_is_the_exact_name() {
+        let (set, _) = build(&[], &[(1, "plain.example.org")]);
+        assert!(is_block(&set.check("plain.example.org")));
+        assert_eq!(set.check("a.plain.example.org"), Verdict::Pass);
+        // An allow has no hosts form, so the same text is a substring pattern.
+        let (set, _) = build(&[], &[(1, "||example.org^\n@@plain.example.org")]);
+        assert!(is_allow(&set.check("a.plain.example.org")));
+    }
+
+    #[test]
+    fn badfilter_cancels_a_wildcard_twin() {
+        let (set, _) = build(
+            &[],
+            &[
+                (1, "||sdk-*.moengage.com^"),
+                (2, "||sdk-*.moengage.com^$badfilter"),
+            ],
+        );
+        assert_eq!(set.check("sdk-01.moengage.com"), Verdict::Pass);
+        assert_eq!(set.rule_count(), 0);
+        let (set, _) = build(
+            &["||sdk-*.moengage.com^"],
+            &[(1, "||sdk-*.moengage.com^$badfilter")],
+        );
+        assert!(is_block(&set.check("sdk-01.moengage.com")), "R11");
+    }
+
     #[test]
     fn list_badfilter_never_cancels_user_rule() {
         let (set, _) = build(&["||x.com^"], &[(1, "||x.com^$badfilter")]);
@@ -455,19 +636,61 @@ mod tests {
             .text()
             .await
             .expect("body");
+        let rss_before = rss_kib();
         let (set, stats) = RuleSet::build(&[], &[(1, &body)]);
+        let rss_after = rss_kib();
         let st = &stats[1];
         println!(
-            "parsed={} indexed={} skipped={:?}",
+            "parsed={} indexed={} patterns={} skipped={:?}",
             st.parsed,
             set.rule_count(),
+            set.patterns.len(),
             st.skipped
         );
         println!(
-            "size_of Entry={} est_bytes={}",
+            "size_of Entry={} est_bytes={} pattern_est_bytes={} rss_delta_kib={}",
             std::mem::size_of::<Entry>(),
-            set.estimated_bytes()
+            set.estimated_bytes(),
+            set.patterns.estimated_bytes(),
+            rss_after.saturating_sub(rss_before)
         );
         assert!(st.parsed > 10_000);
+        assert_eq!(st.skipped.get("wildcard"), None);
+
+        // Names from the shadow compare, against the real list.
+        assert!(is_block(&set.check("kz4tx3-cdn-settings.appsflyersdk.com")));
+        assert!(is_block(&set.check("neqm8i.skadsdkless.appsflyersdk.com")));
+        assert!(is_allow(&set.check("www.googleadservices.com")));
+        assert!(is_allow(&set.check("cdn.taboola.com")));
+
+        let names = [
+            "www.google.com",
+            "i.ytimg.com",
+            "graph.facebook.com",
+            "kz4tx3-cdn-settings.appsflyersdk.com",
+            "mobileanalytics.us-east-1.amazonaws.com",
+            "a-long-subdomain-name.cdn.example-cloud.net",
+        ];
+        let rounds = 20_000;
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            for name in names {
+                std::hint::black_box(set.check(std::hint::black_box(name)));
+            }
+        }
+        let per = start.elapsed().as_nanos() / (rounds * names.len()) as u128;
+        println!("check: {per} ns per name (mean over {} names)", names.len());
+    }
+
+    /// Resident set size of this process, from /proc (Linux only).
+    fn rss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("VmRSS:"))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            })
+            .unwrap_or(0)
     }
 }

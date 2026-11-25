@@ -2,6 +2,8 @@
 
 use std::net::IpAddr;
 
+use super::pattern::Pattern;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
     Rule(Rule),
@@ -13,15 +15,23 @@ pub enum Parsed {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
-    /// Lowercase, no trailing dot.
-    pub domain: String,
+    pub target: Target,
     pub kind: RuleKind,
     pub important: bool,
     pub badfilter: bool,
-    /// Hosts-file lines match the exact name only, like AdGuard; `||domain^` also covers subdomains.
-    pub exact_only: bool,
     /// The original line, trimmed.
     pub text: String,
+}
+
+/// Which names a rule covers. Names are lowercase with no trailing dot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// `||domain^`: the name and every subdomain.
+    Suffix(String),
+    /// Hosts lines and lines that are only a host name: this exact name.
+    Exact(String),
+    /// Any other pattern (wildcards, `|` anchors, unanchored text), matched as AdGuard does.
+    Pattern(Pattern),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +47,6 @@ pub enum SkipReason {
     Regex,
     /// Name of the unsupported `$` modifier.
     Modifier(String),
-    Wildcard,
     UrlPath,
     Invalid,
 }
@@ -73,7 +82,6 @@ impl SkipReason {
                     "modifier:other".into()
                 }
             }
-            SkipReason::Wildcard => "wildcard".into(),
             SkipReason::UrlPath => "url_path".into(),
             SkipReason::Invalid => "invalid".into(),
         }
@@ -121,9 +129,7 @@ pub fn parse_line(line: &str) -> Parsed {
     if pattern.len() > 1 && pattern.starts_with('/') && pattern.ends_with('/') {
         return Parsed::Skip(SkipReason::Regex);
     }
-    let bare = pattern.strip_prefix("||").unwrap_or(pattern);
-    let bare = bare.strip_suffix('^').unwrap_or(bare);
-    if bare.contains('/') {
+    if pattern.contains('/') {
         return Parsed::Skip(SkipReason::UrlPath);
     }
 
@@ -141,16 +147,25 @@ pub fn parse_line(line: &str) -> Parsed {
         }
     }
 
-    let pattern = bare;
-    if pattern.contains('*') {
-        return Parsed::Skip(SkipReason::Wildcard);
-    }
-    let Some(domain) = normalize_domain(pattern) else {
-        return Parsed::Skip(SkipReason::Invalid);
+    let target = if !allow && modifiers.is_none() && is_host_rule_name(pattern) {
+        // AdGuard reads a line that is only a host name as a hosts line for 0.0.0.0, which
+        // blocks that exact name (urlfilter `rules/rule.go` `NewRule` tries `NewHostRule`
+        // first; `dnsengine.go` looks host rules up by the exact hostname).
+        Target::Exact(pattern.to_ascii_lowercase())
+    } else if let Some(domain) = suffix_shape(pattern) {
+        match normalize_domain(domain) {
+            Some(domain) => Target::Suffix(domain),
+            None => return Parsed::Skip(SkipReason::Invalid),
+        }
+    } else {
+        match Pattern::parse(pattern) {
+            Some(p) => Target::Pattern(p),
+            None => return Parsed::Skip(SkipReason::Invalid),
+        }
     };
 
     Parsed::Rule(Rule {
-        domain,
+        target,
         kind: if allow {
             RuleKind::Allow
         } else {
@@ -158,9 +173,43 @@ pub fn parse_line(line: &str) -> Parsed {
         },
         important,
         badfilter,
-        exact_only: false,
         text: text.to_string(),
     })
+}
+
+/// The `domain` of `||domain^`, `||domain^|` or `||domain|`, the forms the suffix table
+/// holds. In a hostname nothing can follow `^`, so all three mean "the name or a
+/// subdomain"; `||domain` with neither is a prefix (`||ads.` matches `ads.example.com`) and
+/// goes to the pattern matcher instead.
+fn suffix_shape(pattern: &str) -> Option<&str> {
+    let body = pattern.strip_prefix("||")?;
+    let domain = body
+        .strip_suffix("^|")
+        .or_else(|| body.strip_suffix('^'))
+        .or_else(|| body.strip_suffix('|'))?;
+    (!domain.contains(['*', '^', '|'])).then_some(domain)
+}
+
+/// urlfilter's `ufnet.IsDomainName`, which decides whether a bare line is a host rule:
+/// labels of letters, digits and inner hyphens, `xn--` labels at least 8 long, and a last
+/// label of 2 or more characters that starts and ends with a letter.
+fn is_host_rule_name(name: &str) -> bool {
+    fn label_ok(label: &str) -> bool {
+        let b = label.as_bytes();
+        !b.is_empty()
+            && b.len() <= 63
+            && (!label.starts_with("xn--") || b.len() >= 8)
+            && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+            && b[0] != b'-'
+            && b[b.len() - 1] != b'-'
+    }
+    // `rsplit` always yields at least one piece.
+    let tld = name.rsplit('.').next().unwrap_or(name).as_bytes();
+    name.len() <= 253
+        && name.split('.').all(label_ok)
+        && tld.len() >= 2
+        && tld[0].is_ascii_alphabetic()
+        && tld[tld.len() - 1].is_ascii_alphabetic()
 }
 
 fn parse_hosts(text: &str) -> Parsed {
@@ -185,7 +234,7 @@ fn parse_hosts(text: &str) -> Parsed {
         return Parsed::Skip(SkipReason::Invalid);
     };
     Parsed::Rule(Rule {
-        domain,
+        target: Target::Exact(domain),
         kind: if ip.is_unspecified() || ip.is_loopback() {
             RuleKind::Block
         } else {
@@ -193,7 +242,6 @@ fn parse_hosts(text: &str) -> Parsed {
         },
         important: false,
         badfilter: false,
-        exact_only: true,
         text: text.to_string(),
     })
 }
@@ -234,7 +282,7 @@ mod tests {
     #[test]
     fn domain_anchor_blocks() {
         let r = rule("||ads.example.com^");
-        assert_eq!(r.domain, "ads.example.com");
+        assert_eq!(r.target, Target::Suffix("ads.example.com".into()));
         assert_eq!(r.kind, RuleKind::Block);
         assert!(!r.important);
         assert!(!r.badfilter);
@@ -244,7 +292,7 @@ mod tests {
     #[test]
     fn exception_allows() {
         let r = rule("@@||ok.example.com^");
-        assert_eq!(r.domain, "ok.example.com");
+        assert_eq!(r.target, Target::Suffix("ok.example.com".into()));
         assert_eq!(r.kind, RuleKind::Allow);
     }
 
@@ -263,12 +311,12 @@ mod tests {
         assert_eq!(rule("127.0.0.1 tracker.net").kind, RuleKind::Block);
         assert_eq!(rule("::1 tracker.net").kind, RuleKind::Block);
         assert_eq!(
-            rule("0.0.0.0\ttracker.net # trailing").domain,
-            "tracker.net"
+            rule("0.0.0.0\ttracker.net # trailing").target,
+            Target::Exact("tracker.net".into())
         );
         let r = rule("10.1.2.3 intranet.example");
         assert_eq!(r.kind, RuleKind::HostsIp("10.1.2.3".parse().unwrap()));
-        assert_eq!(r.domain, "intranet.example");
+        assert_eq!(r.target, Target::Exact("intranet.example".into()));
         assert_eq!(skip("0.0.0.0 a.com b.com"), SkipReason::Invalid);
     }
 
@@ -288,8 +336,45 @@ mod tests {
     }
 
     #[test]
-    fn plain_domain_blocks() {
-        assert_eq!(rule("plain.example.org").domain, "plain.example.org");
+    fn host_name_line_is_an_exact_block() {
+        let r = rule("Plain.Example.org");
+        assert_eq!(r.target, Target::Exact("plain.example.org".into()));
+        assert_eq!(r.kind, RuleKind::Block);
+        // Not a host name by urlfilter's rules, so an unanchored pattern: a leading
+        // hyphen, a trailing dot, a TLD ending in a digit, a short `xn--` label.
+        for line in ["-ad123-", "adserver.", "ads.example.c0", "xn--a.com"] {
+            assert!(matches!(rule(line).target, Target::Pattern(_)), "{line}");
+        }
+        // An allow or a modifier has no hosts form either.
+        assert!(matches!(
+            rule("@@plain.example.org").target,
+            Target::Pattern(_)
+        ));
+        assert!(matches!(
+            rule("plain.example.org$important").target,
+            Target::Pattern(_)
+        ));
+    }
+
+    #[test]
+    fn suffix_shapes_and_patterns() {
+        for line in ["||x.com^", "||x.com^|", "||x.com|", "@@||x.com^|"] {
+            assert_eq!(rule(line).target, Target::Suffix("x.com".into()), "{line}");
+        }
+        for line in [
+            "||*cdn-settings.appsflyersdk.com^",
+            "||aan.amazon.*^",
+            "||sdk-*.moengage.com^",
+            ".skadsdkless.appsflyersdk.com^",
+            "@@|cdn.taboola.com^|",
+            "||an.yandex.",
+            "||direct-specific.com",
+            "w.example.com^",
+        ] {
+            assert!(matches!(rule(line).target, Target::Pattern(_)), "{line}");
+        }
+        let r = rule("@@||*.cdn.example^$important");
+        assert!(r.important && r.kind == RuleKind::Allow);
     }
 
     #[test]
@@ -320,14 +405,17 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_and_url_path_skipped() {
-        assert_eq!(skip("||ad*.example.com^"), SkipReason::Wildcard);
+    fn url_path_skipped() {
         assert_eq!(skip("||example.com/ads/"), SkipReason::UrlPath);
+        assert_eq!(skip("://ads.example.com^"), SkipReason::UrlPath);
     }
 
     #[test]
     fn normalizes_case_and_trailing_dot() {
-        assert_eq!(rule("||EXAMPLE.Com.^").domain, "example.com");
+        assert_eq!(
+            rule("||EXAMPLE.Com.^").target,
+            Target::Suffix("example.com".into())
+        );
     }
 
     #[test]
@@ -340,6 +428,9 @@ mod tests {
             "||bücher.de^",
             "||x.com^$",
             "garbage line here",
+            "||*^",
+            "a|b.com^",
+            "a^",
         ] {
             assert_eq!(skip(line), SkipReason::Invalid, "{line}");
         }
@@ -373,11 +464,19 @@ mod tests {
     }
 
     #[test]
-    fn hosts_lines_are_exact_only_and_adblock_rules_are_not() {
-        assert!(rule("0.0.0.0 tracker.net").exact_only);
-        assert!(rule("10.1.2.3 intranet.example").exact_only);
-        assert!(!rule("||ads.example.com^").exact_only);
-        assert!(!rule("plain.example.org").exact_only);
+    fn hosts_lines_are_exact_and_adblock_rules_are_not() {
+        assert!(matches!(
+            rule("0.0.0.0 tracker.net").target,
+            Target::Exact(_)
+        ));
+        assert!(matches!(
+            rule("10.1.2.3 intranet.example").target,
+            Target::Exact(_)
+        ));
+        assert!(matches!(
+            rule("||ads.example.com^").target,
+            Target::Suffix(_)
+        ));
     }
 
     #[test]
@@ -399,7 +498,6 @@ mod tests {
     #[test]
     fn skip_labels_are_stable() {
         assert_eq!(SkipReason::Regex.label(), "regex");
-        assert_eq!(SkipReason::Wildcard.label(), "wildcard");
         assert_eq!(SkipReason::UrlPath.label(), "url_path");
         assert_eq!(SkipReason::Invalid.label(), "invalid");
         assert_eq!(

@@ -723,6 +723,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn cname_to_a_wildcard_blocked_target_is_blocked() {
+        let state = Arc::new(State::default());
+        let p = pipeline(rules(&[], "||track.*.com^"), &state);
+        let (resp, rec) = p.handle(query("a.com.", RecordType::A), CLIENT).await;
+        assert_eq!(first_a(&resp), Some((Ipv4Addr::UNSPECIFIED, BLOCKED_TTL)));
+        assert_eq!(rec.reason, Reason::Cname);
+        assert_eq!(rec.rule.as_deref(), Some("||track.*.com^"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn allowlisted_name_skips_the_cname_check() {
         let state = Arc::new(State::default());
         let p = pipeline(rules(&["@@||a.com^"], "||adnet.com^"), &state);

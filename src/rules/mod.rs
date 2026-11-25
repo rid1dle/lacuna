@@ -2,7 +2,8 @@
 
 mod engine;
 mod parse;
+mod pattern;
 
 pub use engine::ListStats;
 pub use engine::{RuleSet, Verdict};
-pub use parse::{parse_line, Parsed, Rule, RuleKind};
+pub use parse::{parse_line, Parsed, Rule, RuleKind, Target};
