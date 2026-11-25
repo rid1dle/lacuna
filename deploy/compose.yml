@@ -1,8 +1,9 @@
 # lacuna: the house's ad-blocking DNS server. One container, no database server
 # (SQLite is inside the binary). Target: under 40 MB of RAM.
 #
-# SHADOW MODE (now): the host publishes 5300, AdGuard keeps serving :53.
-# CUTOVER: change the two port lines below from 5300 to 53 (README, "Cutover").
+# LIVE since 2026-11-25: the host publishes :53 and AdGuard is stopped.
+# For a shadow run beside another resolver, change the two port lines to 5300
+# (README, "Run (shadow mode)").
 #
 # First time:
 #   1. ~/homelab/scripts/provision/networks.sh   (creates the lacuna-api network)
@@ -33,8 +34,8 @@ services:
     # Host 5300 (shadow) or 53 (live) onto 5353 inside: no capability is needed to
     # bind a high port in the container.
     ports:
-      - "5300:5353/udp"
-      - "5300:5353/tcp"
+      - "53:5353/udp"
+      - "53:5353/tcp"
     # default: upstream DNS and list downloads. lacuna-api: internal, shared with
     # Sonder only, carries the dashboards' API on 8053.
     networks: [default, lacuna-api]

@@ -136,7 +136,7 @@ Not automated. When the comparison is clean and memory is under AdGuard's:
 1. Go to the folder (every later command assumes it) and switch the two port
    lines from 5300 to 53. No downtime yet:
    ```bash
-   cd ~/homelab/lacuna/deploy
+   cd ~/lacuna/deploy
    sed -i 's|"5300:5353/|"53:5353/|' compose.yml
    grep -n '5353/' compose.yml     # both lines must now start "53:5353/
    ```
@@ -220,7 +220,7 @@ Works from any folder (container names only).
 2. Afterwards, with DNS back, put the ports back to 5300 and bring lacuna back
    in shadow:
    ```bash
-   cd ~/homelab/lacuna/deploy
+   cd ~/lacuna/deploy
    sed -i 's|"53:5353/|"5300:5353/|' compose.yml && docker compose up -d
    ```
 
