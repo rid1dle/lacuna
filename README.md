@@ -1,8 +1,9 @@
 # lacuna
 
 A small ad-blocking DNS server in Rust, built to replace AdGuard Home on this
-server. One static binary in a `scratch` image (about 17 MB on disk, 3 MB of RAM
-idle), SQLite compiled in, no database server.
+server. One static binary in a `scratch` image (about 17 MB on disk; about 45 to
+55 MB of RAM with the AdGuard DNS filter loaded, against AdGuard's 81 MiB),
+SQLite compiled in, no database server.
 
 What it does: blocks names from AdGuard-syntax filter lists, answers a few local
 names itself (`*.home.riddlelab.dev` -> 192.168.0.107), races DoH upstreams
@@ -92,8 +93,9 @@ folder, `lacuna/deploy/`.** Nothing here needs a `cd`.
    docker exec adguard cat /opt/adguardhome/work/data/querylog.json \
      | docker exec -i lacuna /lacuna import-adguard -
    ```
-   Re-running skips what is already imported; `--force` forgets the previous
-   import first.
+   A second run is refused, because it would count every query twice.
+   `--force` forgets the previous import and imports again (only into a fresh
+   database, or the history is doubled). It takes about a minute for 4.5M lines.
 7. Compare against AdGuard on real names, one per line in `names.txt` (in this
    folder). Do this after step 6:
    compare's queries land in AdGuard's log, and an import run afterwards would
@@ -106,6 +108,23 @@ folder, `lacuna/deploy/`.** Nothing here needs a `cd`.
    `errors` must be 0 (the command exits 1 otherwise), or the rest says nothing
    about the names that failed. Then read `differ_outcome`; investigate each line
    before cutover.
+
+## Shadow run results (2026-11-25)
+
+Measured on this server, lacuna on port 5300 next to the live AdGuard, with the
+AdGuard DNS filter (194,783 rules parsed, 22 regex rules skipped).
+
+| Check | Result |
+|---|---|
+| History import | 4,464,298 AdGuard log lines: 1,716,701 kept raw (last 30 days), 2,747,597 into the hourly and daily counts only, 0 skipped. Rollups plus the raw tail equal the lines imported exactly. 68 s; slowest write batch 70 ms. |
+| Compare, 3,378 names from the last 24 h (A and AAAA) | 0 outcome differences. 932 answer differences, all CDN address rotation. 2 errors: one name timed out on both servers. |
+| Before the wildcard work | 64 outcome differences over 33 names, all from rule forms lacuna skipped (`*` inside a name, `\|` anchors, a leading dot). Over the imported window those forms decided 20,278 blocks lacuna would have missed and 1,065 allowed queries it would have blocked. |
+| Memory, process RSS | 45 MB after a fresh start; 55 MB with the DNS cache warm; 63 MB under DNS load plus two dashboard queries; 74 MB at the peak of a rule rebuild (list refresh or config reload). AdGuard: 81 MiB. The 40 MB target is not met yet: moving rule text out of memory is the next change. |
+| Dashboards | Every default panel answers over 1 and 30 days. Slowest at 30 days: cache hit % 0.74 s, top domains per device 0.59 s, all others under 0.3 s. Panels that read raw rows (cache hit %, upstream latency) cover at most the last 7 days: over 30 days they took 2.4 s alone and timed out when two ran under load. |
+| API | 401 without the secret, 401 with a wrong one, 200 with it, from the `lacuna-api` network. |
+
+Not covered by the shadow run: real clients on port 53 (no device uses 5300),
+so the first hour after cutover is the real load test.
 
 ## Cutover (your step)
 
