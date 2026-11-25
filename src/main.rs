@@ -1,6 +1,7 @@
 mod api;
 mod clients;
 mod codes;
+mod compare;
 mod config;
 mod dns;
 mod import;
@@ -33,7 +34,8 @@ use store::{writer, Retention, Store};
 
 const USAGE: &str = "usage: lacuna <check-config <path> | serve <path> | \
                      ask <name> [type] [--server addr] [--expect ip] | \
-                     import-adguard <file|-> [--db path] [--now-ms n] [--force]>";
+                     import-adguard <file|-> [--db path] [--now-ms n] [--force] | \
+                     compare --a addr --b addr --names file [--limit n]>";
 
 /// `ask` waits this long for an answer, UDP plus a TCP retry.
 const ASK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -76,11 +78,81 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        ["compare", rest @ ..] => match parse_compare(rest) {
+            Ok(c) => run_compare(&c),
+            Err(e) => {
+                eprintln!("{e}\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
         }
     }
+}
+
+/// `compare --a addr --b addr --names file [--limit n]`
+#[derive(Debug, PartialEq)]
+struct Compare {
+    a: SocketAddr,
+    b: SocketAddr,
+    names: PathBuf,
+    limit: Option<usize>,
+}
+
+fn parse_compare(args: &[&str]) -> Result<Compare, String> {
+    let (mut a, mut b, mut names, mut limit) = (None, None, None, None);
+    let mut it = args.iter();
+    while let Some(&arg) = it.next() {
+        let mut value = |what: &str| it.next().copied().ok_or(format!("{arg} needs {what}"));
+        match arg {
+            "--a" => a = Some(value("an address")?),
+            "--b" => b = Some(value("an address")?),
+            "--names" => names = Some(value("a file")?),
+            "--limit" => {
+                let n = value("a number")?;
+                limit = Some(n.parse().map_err(|_| format!("bad --limit {n}"))?);
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let addr = |v: Option<&str>, flag: &str| -> Result<SocketAddr, String> {
+        let v = v.ok_or(format!("compare needs {flag}"))?;
+        v.parse().map_err(|_| format!("bad address {v}"))
+    };
+    Ok(Compare {
+        a: addr(a, "--a")?,
+        b: addr(b, "--b")?,
+        names: PathBuf::from(names.ok_or("compare needs --names")?),
+        limit,
+    })
+}
+
+/// Prints one line per difference, then the totals. Exit 1 only when it cannot run
+/// (unreadable names file); differences are the report, not a failure.
+fn run_compare(c: &Compare) -> ExitCode {
+    let text = match std::fs::read_to_string(&c.names) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("reading {}: {e}", c.names.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let names = compare::parse_names(&text, c.limit);
+    let rt = match Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("starting the tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let t = rt.block_on(compare::compare(c.a, c.b, &names, |l| println!("{l}")));
+    println!(
+        "{{ same: {}, differ_outcome: {}, differ_answers: {}, errors: {} }}",
+        t.same, t.differ_outcome, t.differ_answers, t.errors
+    );
+    ExitCode::SUCCESS
 }
 
 /// `import-adguard <file|-> [--db path] [--now-ms n] [--force]`. `-` reads stdin, so
@@ -174,6 +246,7 @@ fn serve(path: &Path) -> ExitCode {
 /// log writer finish its last batch.
 fn serve_with_log(path: &Path) -> Result<()> {
     let config = config::Config::load(path)?;
+    ensure_sqlite_tmpdir();
     let opened = open_store(&config.store);
     // The API tells dashboards why there is no log, rather than showing empty panels.
     let store = opened.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
@@ -193,6 +266,17 @@ fn serve_with_log(path: &Path) -> Result<()> {
         }
     }
     result
+}
+
+/// SQLite spills big sorts to files (temp_store=FILE) in `SQLITE_TMPDIR`. In the
+/// container the root is read-only, so compose points it at `/data/tmp`, which must exist.
+/// Failing to create it is logged, not fatal: DNS does not need it.
+fn ensure_sqlite_tmpdir() {
+    if let Some(dir) = std::env::var_os("SQLITE_TMPDIR") {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!("SQLITE_TMPDIR {}: {e}", Path::new(&dir).display());
+        }
+    }
 }
 
 fn open_store(c: &config::StoreConfig) -> Result<Store> {
@@ -505,6 +589,37 @@ mod tests {
         // A big answer comes back truncated over UDP and is fetched again over TCP.
         let ask = parse_ask(&["big.example", "--server", &server]).unwrap();
         assert_eq!(exchange(&ask).await.unwrap().answers.len(), 40);
+    }
+
+    #[test]
+    fn compare_flags() {
+        let c = parse_compare(&[
+            "--a", "127.0.0.1:5300", "--b", "192.168.0.107:53", "--names", "n.txt", "--limit", "5",
+        ])
+        .unwrap();
+        assert_eq!(c.b, "192.168.0.107:53".parse().unwrap());
+        assert_eq!(c.limit, Some(5));
+        for bad in [
+            &[][..],
+            &["--a", "1.2.3.4:53", "--b", "nope", "--names", "x"],
+            &["--a", "1.2.3.4:53", "--b", "1.2.3.4:54"],
+            &["--bogus"],
+        ] {
+            assert!(parse_compare(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn sqlite_tmpdir_is_created() {
+        let dir = std::env::temp_dir()
+            .join(format!("lacuna-tmpdir-{}", std::process::id()))
+            .join("tmp");
+        // Only this test reads or writes SQLITE_TMPDIR.
+        std::env::set_var("SQLITE_TMPDIR", &dir);
+        ensure_sqlite_tmpdir();
+        std::env::remove_var("SQLITE_TMPDIR");
+        assert!(dir.is_dir());
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
 
     #[test]

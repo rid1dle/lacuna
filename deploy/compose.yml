@@ -1,0 +1,58 @@
+# lacuna: the house's ad-blocking DNS server. One container, no database server
+# (SQLite is inside the binary). Target: under 40 MB of RAM.
+#
+# SHADOW MODE (now): the host publishes 5300, AdGuard keeps serving :53.
+# CUTOVER: change the two port lines below from 5300 to 53 (README, "Cutover").
+#
+# First time:
+#   1. scripts/provision/networks.sh   (creates the lacuna-api network)
+# Then: docker compose up -d --build
+
+services:
+  lacuna:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: homelab/lacuna:latest
+    container_name: lacuna
+    environment:
+      - TZ=Asia/Kolkata
+      # SQLite's temp files (big sorts spill to disk). The root filesystem is
+      # read-only, so they go to the data volume; `serve` creates the folder.
+      - SQLITE_TMPDIR=/data/tmp
+    volumes:
+      - ./config.toml:/config/config.toml:ro
+      - /srv/appdata/lacuna:/data
+    secrets:
+      - lacuna_api
+    # Host 5300 (shadow) or 53 (live) onto 5353 inside: no capability is needed to
+    # bind a high port in the container.
+    ports:
+      - "5300:5353/udp"
+      - "5300:5353/tcp"
+    # default: upstream DNS and list downloads. lacuna-api: internal, shared with
+    # Sonder only, carries the dashboards' API on 8053.
+    networks: [default, lacuna-api]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 96m
+    cpus: 1.0
+    restart: unless-stopped
+    # Asks itself for a name that only the rewrite table answers, so it proves the
+    # listener, the rules and the pipeline, not the internet.
+    healthcheck:
+      test: ["CMD", "/lacuna", "ask", "home.riddlelab.dev", "A", "--server", "127.0.0.1:5353", "--expect", "192.168.0.107"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+secrets:
+  lacuna_api:
+    file: ./secrets/lacuna_api
+
+networks:
+  # internal: no route off the host. Only lacuna and Sonder.
+  lacuna-api:
+    external: true
