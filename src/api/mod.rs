@@ -467,9 +467,10 @@ async fn reload_config<F: Fetch + 'static, U: Upstream>(rt: &Runtime<F, U>) -> (
             info!("{}", report.summary());
         });
     }
+    // What `Config` holds that nothing above swaps in: read once at startup.
     message.push_str(
-        ". Upstreams, listen addresses and the [api] and [store] sections apply at the next \
-         restart.",
+        ". [upstreams], dns.listen, dns.max_inflight, dns.router and the [api] and [store] \
+         sections apply at the next restart.",
     );
     (true, message)
 }
@@ -1498,6 +1499,17 @@ mod tests {
         std::fs::write(path, &good).unwrap();
         let (ok, message) = r.act("reload_config", json!({})).await;
         assert!(ok, "{message}");
+        // Everything outside LiveConfig, the lists and the device names is read once at start.
+        for needs_restart in [
+            "[upstreams]",
+            "dns.listen",
+            "dns.max_inflight",
+            "dns.router",
+            "[api]",
+            "[store]",
+        ] {
+            assert!(message.contains(needs_restart), "{needs_restart}: {message}");
+        }
         assert_eq!(rewrites(), 3);
         let (_, verdict) = r.act("test_domain", json!({ "name": "nas.lan" })).await;
         assert_eq!(verdict, "rewritten to 192.168.0.50");

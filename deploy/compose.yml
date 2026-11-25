@@ -42,8 +42,14 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 96m
-    cpus: 1.0
+    # No cpus limit: a spent CFS quota pauses every thread, DNS answers included.
     restart: unless-stopped
+    # No daemon.json on this host sets rotation, so the default would grow without end.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # Asks itself for a name that only the rewrite table answers, so it proves the
     # listener, the rules and the pipeline, not the internet.
     healthcheck:

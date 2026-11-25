@@ -83,6 +83,11 @@ impl Cache {
         };
         let mut entries = self.lock();
         if !entries.contains_key(&key) && entries.len() >= self.max_entries {
+            // Entries past the stale window can never be served again, and a lookup is the
+            // only other thing that removes them: drop them all before evicting a live one.
+            entries.retain(|_, e| now < e.expires + STALE_WINDOW);
+        }
+        if !entries.contains_key(&key) && entries.len() >= self.max_entries {
             // A scan is fine at this size; a heap would only pay off if profiling says so.
             let soonest = entries
                 .iter()
@@ -253,6 +258,50 @@ mod tests {
         assert!(matches!(cache.get(&key("short.com"), t0), Lookup::Miss));
         assert!(matches!(cache.get(&key("long.com"), t0), Lookup::Fresh(_)));
         assert!(matches!(cache.get(&key("new.com"), t0), Lookup::Fresh(_)));
+    }
+
+    #[test]
+    fn eviction_scan_drops_every_entry_past_its_stale_window() {
+        let cache = Cache::new(3);
+        let t0 = Instant::now();
+        cache.put(key("dead1.com"), &a_response(&[10]), t0);
+        cache.put(key("dead2.com"), &a_response(&[20]), t0);
+        cache.put(key("live.com"), &a_response(&[86_400]), t0);
+        // Both short entries are now more than 12 h past expiry: the insert at the cap
+        // removes both, not only the one that expires soonest.
+        let later = t0 + secs(20 + 12 * 3600 + 1);
+        cache.put(key("new.com"), &a_response(&[300]), later);
+        assert_eq!(cache.len(), 2);
+        assert!(matches!(cache.get(&key("live.com"), later), Lookup::Fresh(_)));
+        assert!(matches!(cache.get(&key("new.com"), later), Lookup::Fresh(_)));
+    }
+
+    #[test]
+    fn eviction_scan_keeps_entries_inside_the_stale_window() {
+        let cache = Cache::new(3);
+        let t0 = Instant::now();
+        cache.put(key("dead.com"), &a_response(&[10]), t0);
+        cache.put(key("stale.com"), &a_response(&[3600]), t0);
+        cache.put(key("live.com"), &a_response(&[86_400]), t0);
+        // stale.com expired 11 h ago: still servable, so the scan must keep it. Removing
+        // dead.com frees a slot, so nothing live is evicted either.
+        let later = t0 + secs(10 + 12 * 3600 + 1);
+        cache.put(key("new.com"), &a_response(&[300]), later);
+        assert_eq!(cache.len(), 3);
+        assert!(matches!(cache.get(&key("stale.com"), later), Lookup::Stale(_)));
+        assert!(matches!(cache.get(&key("live.com"), later), Lookup::Fresh(_)));
+    }
+
+    #[test]
+    fn cap_holds_under_many_inserts() {
+        let cache = Cache::new(50);
+        let t0 = Instant::now();
+        for i in 0..500u64 {
+            let at = t0 + secs(i);
+            cache.put(key(&format!("n{i}.com")), &a_response(&[60 + i as u32]), at);
+            assert!(cache.len() <= 50);
+        }
+        assert_eq!(cache.len(), 50);
     }
 
     #[test]

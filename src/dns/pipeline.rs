@@ -19,8 +19,12 @@ use crate::codes::{Outcome, Reason, ServedFrom};
 use crate::config::{Config, Rewrite};
 use crate::rules::{RuleSet, Verdict};
 
-/// Entries in the answer cache.
-const CACHE_ENTRIES: usize = 20_000;
+/// Entries in the answer cache. Sized from the house's own traffic: distinct allowed
+/// (name, type) pairs in the imported AdGuard history were 2,217 in 12 h, 4,901 in 24 h
+/// and 9,607 in 7 days, so 8,000 holds more than a day of names. The cache fills to its
+/// cap and stays there; 20,000 entries measured 41,496 KiB for CNAME plus 4 A answers
+/// (about 2.1 KB each), which would have pushed a rebuild past AdGuard's 81 MiB.
+const CACHE_ENTRIES: usize = 8_000;
 
 /// One handled query, as the log writer stores it.
 #[derive(Debug, Clone)]

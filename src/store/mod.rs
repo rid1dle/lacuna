@@ -35,8 +35,8 @@ pub const IST_OFFSET_MS: i64 = 19_800_000;
 /// count the same queries twice, so it is refused while this is set.
 const ADGUARD_IMPORTED_AT: &str = "adguard_imported_at";
 
-/// The list id of the user rules from config.toml.
-const USER_LIST_ID: u32 = 0;
+/// The list id of the user rules from config.toml. Config validation keeps lists off it.
+pub const USER_LIST_ID: u32 = 0;
 
 /// Response codes the views name (RFC 1035 and 2136 mnemonics); others show as `RCODE<n>`.
 const RCODE_LABELS: &[(u16, &str)] = &[

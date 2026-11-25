@@ -133,7 +133,26 @@ impl<U: Upstream> Devices<U> {
     }
 
     /// Runs `pass` forever.
-    pub async fn run(self) {
+    /// Config names first, then the PTR loop, in one background task so the PTR pass
+    /// never runs before the config names it must not overwrite. Writing the names can
+    /// wait up to busy_timeout for the log writer's lock, so it runs on a blocking thread:
+    /// DNS is already listening and must not wait with it.
+    pub fn start(self, names: BTreeMap<IpAddr, String>) -> tokio::task::JoinHandle<()>
+    where
+        U: 'static,
+    {
+        tokio::spawn(async move {
+            let db = self.db.clone();
+            match tokio::task::spawn_blocking(move || apply_config_names(&db, &names)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("device names from config not applied: {e:#}"),
+                Err(e) => warn!("device names from config not applied: {e}"),
+            }
+            self.run().await;
+        })
+    }
+
+    async fn run(self) {
         tokio::time::sleep(FIRST_PASS).await;
         loop {
             if let Err(e) = self.pass(now_ms()).await {
@@ -336,6 +355,43 @@ mod tests {
 
     fn cfg(pairs: &[(&str, &str)]) -> BTreeMap<IpAddr, String> {
         pairs.iter().map(|(i, n)| (ip(i), n.to_string())).collect()
+    }
+
+    /// The DNS listener is up before names are written, so a database locked by the log
+    /// writer (busy_timeout 5 s) must not hold up the caller.
+    #[tokio::test]
+    async fn start_does_not_wait_for_a_locked_database() {
+        let db = db_with("startlock", &[]);
+        let mut holder = connect(&db.0).unwrap();
+        // IMMEDIATE (the connection's default) takes the write lock at once.
+        let lock = holder.transaction().unwrap();
+        let (addr, _) = fake_router(None).await;
+        let begun = std::time::Instant::now();
+        let task = devices(&db, addr).start(cfg(&[("192.168.0.9", "tv")]));
+        assert!(
+            begun.elapsed() < Duration::from_secs(1),
+            "start waited {:?} for the lock",
+            begun.elapsed()
+        );
+        drop(lock);
+        let named = || {
+            connect(&db.0)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM client_names WHERE ip = '192.168.0.9' AND name = 'tv'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+                == 1
+        };
+        let mut waited = 0;
+        while !named() {
+            assert!(waited < 500, "config names never written once the lock was free");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        task.abort();
     }
 
     #[tokio::test]

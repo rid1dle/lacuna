@@ -25,6 +25,12 @@ use crate::config::UpstreamConfig;
 const DOH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Short enough that a second bootstrap IP is tried when the first one is blackholed.
 const DOH_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
+/// HTTP/2 PING on the pooled DoH connection, idle or not. Without it a connection that
+/// died silently (a WAN blip drops the NAT state and no RST arrives) stays in the pool,
+/// and queries sent on it time out until TCP notices, which can take minutes.
+const DOH_PING_EVERY: Duration = Duration::from_secs(10);
+/// No PONG within this closes the connection, so the next query dials a fresh one.
+const DOH_PING_TIMEOUT: Duration = Duration::from_secs(3);
 /// A DNS message is at most 64 KiB; refuse more from a misbehaving server.
 const DOH_MAX_BODY: usize = 64 * 1024;
 /// Plain DNS to a fallback server: the whole exchange, UDP or TCP.
@@ -99,7 +105,10 @@ impl DohUpstream {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(DOH_CONNECT_TIMEOUT)
-            .timeout(DOH_REQUEST_TIMEOUT);
+            .timeout(DOH_REQUEST_TIMEOUT)
+            .http2_keep_alive_interval(DOH_PING_EVERY)
+            .http2_keep_alive_timeout(DOH_PING_TIMEOUT)
+            .http2_keep_alive_while_idle(true);
         if !bootstrap.is_empty() {
             let addrs: Vec<SocketAddr> = bootstrap
                 .iter()

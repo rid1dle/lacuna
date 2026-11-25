@@ -376,11 +376,9 @@ async fn serve_dns(
             config.api.listen
         ),
     }
-    // Names are resolved off the query path: config names now, router PTR in the background.
-    if let Err(e) = clients::apply_config_names(&config.store.path, &config.devices) {
-        warn!("device names from config not applied: {e:#}");
-    }
-    tokio::spawn(clients::Devices::new(config.store.path.clone(), config.dns.router).run());
+    // Names are resolved off the query path: config names, then router PTR, in the background.
+    clients::Devices::new(config.store.path.clone(), config.dns.router)
+        .start(config.devices.clone());
     tokio::select! {
         () = server::run(pipeline, listeners, log) => Ok(()),
         stop = shutdown_signal() => {

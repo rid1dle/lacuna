@@ -159,10 +159,25 @@ First hour after cutover (the shadow run had no real clients, so this is the
 real load test). Until Sonder's dashboards exist, read the numbers through the
 API from the `lacuna-api` network (see `CONTRACT.md` for the call):
 
-- `SELECT name, value FROM counters`: `log_dropped` must stay 0, and
-  `queries_total` must keep rising.
-- `docker stats lacuna`: memory under about 75 MB (the shadow run's rebuild
-  peak); a steady climb past that is a reason to roll back.
+- Counters, from `lacuna/deploy/` (a throwaway curl container on the API network;
+  the secret file is group 3070, hence `--group-add`):
+  ```bash
+  docker run --rm --network lacuna-api --group-add 3070 \
+    -v "$PWD/secrets/lacuna_api:/run/secrets/lacuna_api:ro" \
+    --entrypoint sh curlimages/curl:8.10.1 -c \
+    'curl -sS -H "Authorization: Bearer $(cat /run/secrets/lacuna_api)" \
+       -H "Content-Type: application/json" \
+       -d "{\"sql\":\"SELECT name, value FROM counters\"}" \
+       http://lacuna:8053/integration/query'
+  ```
+  `log_dropped` must stay 0, and `queries_total` must keep rising.
+- Memory, as process RSS (how the shadow numbers were taken; `docker stats`
+  also counts page cache, so it reads higher):
+  ```bash
+  grep VmRSS /proc/$(docker inspect lacuna --format '{{.State.Pid}}')/status
+  ```
+  It must stay under <RE-MEASURED> (the shadow run's rebuild peak); a steady
+  climb past that is a reason to roll back.
 - Browse normally on a phone and a laptop. A site that breaks and works with
   AdGuard is a rule difference: note the name, then check it with the
   `test_domain` action.
@@ -175,9 +190,14 @@ one command. Remove them only after that, as a separate step.
 Run from `lacuna/deploy/`, no `cd`.
 
 1. Free port 53 and start AdGuard. **Starting AdGuard is what restores DNS.**
+   Container names, not `docker compose`, so this works even if the port edit
+   broke `compose.yml`:
    ```bash
-   docker compose stop && docker start adguard
+   docker stop lacuna; docker start adguard
    ```
+   `;`, not `&&`: AdGuard must start whatever the first command says. Stopping
+   an already stopped container exits 0, but a missing one (a failed `up` can
+   leave none) exits 1, and `&&` would then skip AdGuard.
 2. Afterwards, with DNS back, change the two port lines in `compose.yml`
    back to `5300`.
 

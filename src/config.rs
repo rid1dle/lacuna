@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use crate::store::USER_LIST_ID;
+
 // `deny_unknown_fields` turns a typo like `row_capp` into a load error
 // instead of a silently ignored setting.
 #[derive(Debug, Deserialize)]
@@ -151,6 +153,10 @@ impl Config {
 
         let mut seen = std::collections::BTreeSet::new();
         for l in &self.lists {
+            ensure!(
+                l.id != USER_LIST_ID,
+                "list id {USER_LIST_ID} is taken by the user rules; number lists from 1"
+            );
             ensure!(seen.insert(l.id), "duplicate list id {}", l.id);
         }
         for r in &self.rewrites {
@@ -188,6 +194,15 @@ mod tests {
     fn rejects_duplicate_list_ids() {
         let text = DEPLOY.replace("id = 2", "id = 1");
         assert!(Config::parse(&text).is_err());
+    }
+
+    #[test]
+    fn rejects_list_id_zero() {
+        // 0 is the user rules' list id in the store, so a list must not take it.
+        let text = DEPLOY.replacen("id = 1\n", "id = 0\n", 1);
+        assert_ne!(text, DEPLOY, "fixture text moved");
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("list id 0"), "{err}");
     }
 
     #[test]
