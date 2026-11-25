@@ -12,19 +12,20 @@
 //!   objects, `load_extension`;
 //! * only one statement runs; anything but whitespace or comments after it is refused,
 //!   and SQLite must judge that statement read-only;
-//! * limits cap the SQL length, the size of any one value, the columns in a row, and
-//!   attached databases at 0; a budget caps the bytes of the whole result;
+//! * limits cap the SQL length, the size of any one value, the columns in a row, the
+//!   function calls in the user's SQL, and attached databases at 0; a budget caps the
+//!   bytes of the whole result;
 //! * a deadline, and the row cap.
 //!
 //! The deadline is approximate. SQLite consults the progress handler only at loop jumps,
 //! every `PROGRESS_STEPS` VM instructions, and one instruction can be one long function
-//! call: the worst measured is `instr` with a 64 KiB haystack and a 32 KiB needle, about
-//! 0.3 s. Each returned row is also checked against the deadline as it arrives, so rows
-//! that each make such a call stop about one call late (260 ms at a 200 ms limit). Rows
-//! that are filtered or aggregated, not returned, are checked only every few rows (about
-//! 1 s at a 200 ms limit). Calls within one row are never checked between: the late row
-//! is answered with `Timeout`, but the work already done is (calls in the row) x 0.3 s,
-//! bounded only by the SQL length.
+//! call: the worst measured is `instr` with a 16 KiB haystack and an 8 KiB needle, about
+//! 16 to 19 ms. Each returned row is also checked against the deadline as it arrives, so
+//! rows that each make such a call stop about one call late (213 ms at a 200 ms limit).
+//! Calls within one row are never checked between, so `MAX_FUNCTION_REFS` bounds them:
+//! 64 worst calls in one row ran 1.07 s against a 200 ms limit and were answered with
+//! `Timeout`. Rows that are filtered or aggregated, not returned, are checked every few
+//! rows, or every row once a row holds that many calls, so the same bound holds.
 //!
 //! Each query gets its own connection, closed when it returns, so nothing it sets can
 //! leak into the next one, and the log writer's connection is never touched.
@@ -50,18 +51,23 @@ const PROGRESS_STEPS: i32 = 100;
 const MAX_SQL_BYTES: i32 = 100_000;
 /// The largest string or blob a query may build or read (SQLITE_LIMIT_LENGTH). One big
 /// value is built inside a single VM instruction, where the deadline cannot stop it, and
-/// quadratic functions (`instr`, `replace`) cost about the square of their input. Log
-/// values are short (domains at most 253 bytes, rule texts far below 64 KiB).
-const MAX_VALUE_BYTES: i32 = 64 * 1024;
+/// quadratic functions (`instr`, `replace`) cost about the square of their input: the
+/// worst `instr` measured 286 ms at 64 KiB and 19 ms at 16 KiB. Log values are short
+/// (domains at most 253 bytes, rule texts far below 16 KiB).
+const MAX_VALUE_BYTES: i32 = 16 * 1024;
 /// SQLITE_LIMIT_COLUMN (default 2000). The widest row SQLite can build is then
-/// 100 x 64 KiB = 6.4 MiB, the most one row can add on top of the result budget.
+/// 100 x 16 KiB = 1.6 MiB, the most one row can add on top of the result budget.
 const MAX_COLUMNS: i32 = 100;
+/// Function references allowed in the user's SQL (those inside our views are not
+/// counted). Calls within one row run back to back with no deadline check between them,
+/// so this caps that run: 64 x 19 ms (worst `instr` at 16 KiB) is about 1.2 s.
+const MAX_FUNCTION_REFS: usize = 64;
 /// The bytes a result may hold before the query is refused, counted as the rows are
 /// read, so memory never passes this plus one row. Each value counts its in-memory slot
 /// (a `serde_json::Value`, 32 bytes, even for a number or null) plus its text: 10,000
 /// log rows of all 17 `queries` columns measured 6.6 MB. Measured peak per query at this
-/// budget, with SQLite's own copies of the widest rows: 23 MB. Two at once
-/// (api.max_concurrent) is 46 MB, beside DNS's 40 MB target in the 96 MiB container.
+/// budget, with SQLite's own copies of the widest rows: 14 MB. Two at once
+/// (api.max_concurrent) is 28 MB, beside DNS's 40 MB target in the 96 MiB container.
 const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 /// Set before the authorizer is installed, which would refuse them. cache_size is
 /// negative KiB: 2 MB. temp_store FILE sends sort and temp-table spills to SQLITE_TMPDIR
@@ -128,6 +134,10 @@ pub enum QueryError {
     MultipleStatements,
     UnknownParam(String),
     Timeout,
+    /// The SQL calls more functions than the cap allows.
+    TooManyFunctions {
+        limit: usize,
+    },
     /// The rows held so far passed the result budget.
     ResultTooLarge {
         limit_bytes: usize,
@@ -142,6 +152,9 @@ impl fmt::Display for QueryError {
             QueryError::MultipleStatements => f.write_str("only one statement is allowed"),
             QueryError::UnknownParam(name) => write!(f, "parameter :{name} has no value"),
             QueryError::Timeout => f.write_str("query stopped at the time limit"),
+            QueryError::TooManyFunctions { limit } => {
+                write!(f, "the query calls more than {limit} functions")
+            }
             QueryError::ResultTooLarge { limit_bytes } => write!(
                 f,
                 "result passed {limit_bytes} bytes; select fewer rows or columns"
@@ -162,13 +175,13 @@ pub fn run_query(
     limits: &QueryLimits,
 ) -> Result<Frame, QueryError> {
     let started = Instant::now();
-    let denied = Arc::new(Mutex::new(None));
-    let conn = open(db_path, started + limits.timeout, Arc::clone(&denied))
-        .map_err(|e| classify(e, &denied))?;
+    let auth = Arc::new(Mutex::new(AuthState::default()));
+    let conn = open(db_path, started + limits.timeout, Arc::clone(&auth))
+        .map_err(|e| classify(e, &auth))?;
     let deadline = started + limits.timeout;
     let frame = execute(&conn, sql, params, limits.row_cap, deadline).map_err(|e| match e {
         Failure::Query(q) => q,
-        Failure::Sqlite(e) => classify(e, &denied),
+        Failure::Sqlite(e) => classify(e, &auth),
     })?;
     Ok(Frame {
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -176,12 +189,12 @@ pub fn run_query(
     })
 }
 
-/// A read-only connection with every guard installed. `denied` receives a description
-/// of the first action the authorizer refuses.
+/// A read-only connection with every guard installed. `auth` records what the
+/// authorizer counts and refuses.
 fn open(
     db_path: &Path,
     deadline: Instant,
-    denied: Arc<Mutex<Option<String>>>,
+    auth: Arc<Mutex<AuthState>>,
 ) -> rusqlite::Result<Connection> {
     // Spelled out rather than `OpenFlags::default()`, which would add READ_WRITE, CREATE
     // and URI. NO_MUTEX: the connection never leaves this thread.
@@ -196,28 +209,58 @@ fn open(
     conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, MAX_COLUMNS)?;
     conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
     conn.authorizer(Some(move |ctx: AuthContext<'_>| {
-        authorize(ctx.action, &denied)
+        authorize(ctx.action, ctx.accessor, &auth)
     }))?;
     // Returning true interrupts the running statement with SQLITE_INTERRUPT.
     conn.progress_handler(PROGRESS_STEPS, Some(move || Instant::now() >= deadline))?;
     Ok(conn)
 }
 
-fn authorize(action: AuthAction<'_>, denied: &Mutex<Option<String>>) -> Authorization {
-    let allowed = match action {
-        AuthAction::Select | AuthAction::Read { .. } | AuthAction::Recursive => true,
-        AuthAction::Function { function_name } => !DENIED_FUNCTIONS
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case(function_name)),
-        _ => false,
+/// What the authorizer saw while SQLite compiled the statement.
+#[derive(Default)]
+struct AuthState {
+    /// The first refusal, reported instead of SQLite's generic "not authorized".
+    refused: Option<QueryError>,
+    /// Function references in the user's SQL.
+    functions: usize,
+}
+
+/// `accessor` names the view whose body SQLite is compiling, or is None for the user's
+/// own SQL.
+fn authorize(
+    action: AuthAction<'_>,
+    accessor: Option<&str>,
+    auth: &Mutex<AuthState>,
+) -> Authorization {
+    let Ok(mut auth) = auth.lock() else {
+        return Authorization::Deny;
     };
-    if allowed {
-        return Authorization::Allow;
+    let refusal = match action {
+        AuthAction::Select | AuthAction::Read { .. } | AuthAction::Recursive => None,
+        AuthAction::Function { function_name }
+            if DENIED_FUNCTIONS
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(function_name)) =>
+        {
+            Some(QueryError::NotReadOnly(format!("{action:?}")))
+        }
+        AuthAction::Function { .. } => {
+            if accessor.is_none() {
+                auth.functions += 1;
+            }
+            (auth.functions > MAX_FUNCTION_REFS).then_some(QueryError::TooManyFunctions {
+                limit: MAX_FUNCTION_REFS,
+            })
+        }
+        _ => Some(QueryError::NotReadOnly(format!("{action:?}"))),
+    };
+    match refusal {
+        None => Authorization::Allow,
+        Some(r) => {
+            auth.refused.get_or_insert(r);
+            Authorization::Deny
+        }
     }
-    if let Ok(mut first) = denied.lock() {
-        first.get_or_insert_with(|| format!("{action:?}"));
-    }
-    Authorization::Deny
 }
 
 /// A query refused by this module's own checks, or an error from SQLite.
@@ -370,9 +413,9 @@ fn to_json(v: ValueRef<'_>) -> Value {
 /// Names a SQLite error for the caller: refused by the authorizer or by read-only mode,
 /// stopped at the deadline, or an ordinary SQL error. The authorizer's own record comes
 /// first: a refused function, unlike a refused statement, fails with a plain SQLITE_ERROR.
-fn classify(e: rusqlite::Error, denied: &Mutex<Option<String>>) -> QueryError {
-    if let Some(what) = denied.lock().ok().and_then(|mut d| d.take()) {
-        return QueryError::NotReadOnly(what);
+fn classify(e: rusqlite::Error, auth: &Mutex<AuthState>) -> QueryError {
+    if let Some(refused) = auth.lock().ok().and_then(|mut a| a.refused.take()) {
+        return refused;
     }
     match e.sqlite_error_code() {
         Some(ErrorCode::AuthorizationForStatementDenied | ErrorCode::ReadOnly) => {
@@ -716,10 +759,10 @@ mod tests {
     fn oversized_values_refused() {
         // One big value is built inside a single VM step, where no deadline can stop it.
         let f = Fixture::new();
-        let r = f.run("SELECT length(randomblob(70000))");
+        let r = f.run("SELECT length(randomblob(16385))");
         assert_eq!(r, Err(QueryError::Sql("string or blob too big".into())));
-        let r = f.run("SELECT length(randomblob(65536))").unwrap();
-        assert_eq!(r.rows, [[json!(65536)]]);
+        let r = f.run("SELECT length(randomblob(16384))").unwrap();
+        assert_eq!(r.rows, [[json!(16384)]]);
 
         let long = format!("SELECT 1 -- {}", "x".repeat(100_000));
         match f.run(&long) {
@@ -743,10 +786,10 @@ mod tests {
 
     #[test]
     fn large_result_refused() {
-        // 300 rows of 60 KB text: each value is allowed, together they are 18 MB.
+        // 1,000 rows of 16 KB text: each value is allowed, together they are 16 MB.
         let f = Fixture::new();
-        let sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 300)
-                   SELECT hex(zeroblob(30000)) FROM n";
+        let sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000)
+                   SELECT hex(zeroblob(8000)) FROM n";
         let r = f.run_with(sql, &BTreeMap::new(), limits(10_000));
         assert_eq!(
             r,
@@ -768,28 +811,75 @@ mod tests {
         assert!(!frame.truncated);
     }
 
+    /// The worst input for `instr` at the value limit: a 16 KiB haystack of '0' and a
+    /// needle of half that, '0's then a '1', compared in full at every offset. Bound as
+    /// params so the SQL's only function references are the calls under test.
+    /// `instr(:h, :n)` alone would be a constant, computed once, so the tests append an
+    /// empty column to :h with `||` (an operator, not a function, and no jump) to make
+    /// every call really run. 10 bytes short of the limit leave room for that column.
+    fn worst_instr_params() -> BTreeMap<String, ParamValue> {
+        let half = MAX_VALUE_BYTES as usize / 2;
+        params(&[
+            (
+                "h",
+                ParamValue::Text("0".repeat(MAX_VALUE_BYTES as usize - 10)),
+            ),
+            ("n", ParamValue::Text(format!("{}1", "0".repeat(half - 1)))),
+        ])
+    }
+
     #[test]
     fn stacked_expensive_calls_are_stopped() {
-        // Each instr compares a 32 KB needle at every offset of a 64 KB haystack: about
-        // 0.3 s inside one VM step. Row after row, the progress handler stops them.
+        // Each instr runs inside one VM step. Row after row, the progress handler and the
+        // per-row deadline stop them.
         let f = Fixture::new();
         let limits = QueryLimits {
             timeout: Duration::from_millis(200),
             row_cap: 100,
         };
-        let per_row =
-            "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r WHERE x < 20),
-                       s(h) AS (SELECT hex(zeroblob(32760)))
-                       SELECT instr(h, hex(zeroblob(16380)) || '1') FROM r, s";
-        // Within one row no check runs between the calls; the row still counts as late.
-        let one_row = "WITH s(h, n) AS (SELECT hex(zeroblob(32767)), hex(zeroblob(16383)) || '1')
-                       SELECT instr(h, n) + instr(h, n) + instr(h, n) FROM s";
+        // `answers` is '' in the fixture.
+        let call = "instr(:h || answers, :n)";
+        let per_row = format!(
+            "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r WHERE x < 50)
+             SELECT {call} FROM r, (SELECT answers FROM raw_queries LIMIT 1)"
+        );
+        // Within one row no check runs between the calls: the function cap bounds them.
+        let one_row = format!(
+            "SELECT {} FROM raw_queries LIMIT 1",
+            vec![call; 64].join(" + ")
+        );
+        let p = worst_instr_params();
         for sql in [per_row, one_row] {
             let started = Instant::now();
-            let r = f.run_with(sql, &BTreeMap::new(), limits);
+            let r = f.run_with(&sql, &p, limits);
             let took = started.elapsed();
             assert_eq!(r, Err(QueryError::Timeout), "{sql}");
             assert!(took < Duration::from_secs(2), "{took:?}: {sql}");
         }
+    }
+
+    #[test]
+    fn function_references_capped() {
+        let f = Fixture::new();
+        let sum = |n: usize| format!("SELECT {}", vec!["abs(1)"; n].join(" + "));
+        assert_eq!(f.run(&sum(64)).unwrap().rows, [[json!(64)]]);
+        assert_eq!(
+            f.run(&sum(65)),
+            Err(QueryError::TooManyFunctions { limit: 64 })
+        );
+    }
+
+    #[test]
+    fn view_functions_are_not_counted() {
+        // `time` and `device` are computed in the view (strftime, coalesce): only the
+        // user's own 64 references count.
+        let f = Fixture::new();
+        let sql = format!(
+            "SELECT time, device, {} AS n FROM queries LIMIT 1",
+            vec!["abs(1)"; 64].join(" + ")
+        );
+        let frame = f.run(&sql).unwrap();
+        assert_eq!(frame.rows[0][1], json!("laptop"));
+        assert_eq!(frame.rows[0][2], json!(64));
     }
 }
