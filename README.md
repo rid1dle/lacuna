@@ -140,15 +140,24 @@ Run from `lacuna/deploy/`, no `cd`. Not automated. When the comparison is clean 
    ```bash
    docker stop adguard && docker compose up -d
    ```
-3. Check from another LAN machine, UDP and TCP:
+3. Check. The server has no `dig`, so use lacuna's own `ask` there (exit 0
+   means the answer matched `--expect`, exit 1 means it did not):
    ```bash
-   dig @192.168.0.107 home.riddlelab.dev +short           # 192.168.0.107
-   dig +tcp @192.168.0.107 home.riddlelab.dev +short      # 192.168.0.107
-   dig @192.168.0.107 doubleclick.net +short              # 0.0.0.0
+   docker run --rm --network host --entrypoint /lacuna homelab/lacuna:latest \
+     ask home.riddlelab.dev A --server 192.168.0.107:53 --expect 192.168.0.107; echo "exit=$?"
+   docker run --rm --network host --entrypoint /lacuna homelab/lacuna:latest \
+     ask doubleclick.net A --server 192.168.0.107:53 --expect 0.0.0.0; echo "exit=$?"
+   docker run --rm --network host --entrypoint /lacuna homelab/lacuna:latest \
+     ask example.com A --server 192.168.0.107:53; echo "exit=$?"
+   docker compose ps          # must show healthy
    ```
-   The last one proves the lists loaded, and also that DoH and TLS work from the
-   scratch image (nothing else proves that). On the server, `docker compose ps`
-   must show `healthy`.
+   The first proves the rewrite table, the second that the block lists loaded,
+   the third (any real address) that the upstreams answer over DoH from the
+   scratch image. `ask` speaks UDP only, so check TCP once from a Mac on the LAN
+   (macOS ships `dig`):
+   ```bash
+   dig +tcp @192.168.0.107 home.riddlelab.dev +short      # 192.168.0.107
+   ```
 4. **If `up` fails or any check fails, run Rollback now.** Do not debug while the
    house has no DNS.
 
