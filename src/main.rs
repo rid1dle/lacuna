@@ -2,6 +2,7 @@ mod codes;
 mod config;
 mod dns;
 mod rules;
+mod store;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -17,9 +18,10 @@ use tokio::runtime::Builder;
 use tracing::{error, info};
 use tracing_subscriber::filter::LevelFilter;
 
-use dns::pipeline::{self, LiveConfig, NoopSink, Pipeline};
+use dns::pipeline::{self, LiveConfig, LogSink, Pipeline};
 use dns::server::{self, Listeners};
 use dns::upstream::{UdpUpstream, Upstream, Upstreams};
+use store::{writer, Retention, Store};
 
 const USAGE: &str = "usage: sieve <check-config <path> | serve <path> | \
                      ask <name> [type] [--server addr] [--expect ip]>";
@@ -84,6 +86,14 @@ fn serve(path: &Path) -> ExitCode {
 
 async fn serve_dns(path: &Path) -> Result<()> {
     let config = config::Config::load(path)?;
+    let mut store = Store::open(&config.store.path)?;
+    store.retention = Retention {
+        raw_days: config.store.raw_days,
+        rollup_days: config.store.rollup_days,
+    };
+    info!(path = %config.store.path.display(), "query log open");
+    let log: Arc<dyn LogSink> = Arc::new(writer::spawn(store, writer::CHANNEL_CAPACITY));
+
     // User rules only for now; filter lists join the set when the list manager lands.
     let (rules, stats) = rules::RuleSet::build(&config.user_rules, &[]);
     let skipped: usize = stats.iter().flat_map(|s| s.skipped.values()).sum();
@@ -98,7 +108,7 @@ async fn serve_dns(path: &Path) -> Result<()> {
     let listeners = Listeners::bind(config.dns.listen).await?;
     info!(addr = %listeners.local_addr()?, "dns listening on udp and tcp");
     tokio::select! {
-        () = server::run(pipeline, listeners, Arc::new(NoopSink)) => Ok(()),
+        () = server::run(pipeline, listeners, log) => Ok(()),
         stop = shutdown_signal() => {
             info!("shutting down");
             stop
@@ -210,8 +220,8 @@ fn ask(a: &Ask) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::pipeline::shared;
     use crate::dns::pipeline::testing::{live, rules, upstreams, State};
+    use crate::dns::pipeline::{shared, NoopSink};
     use hickory_proto::op::ResponseCode;
     use std::sync::Arc;
     use std::time::Duration;

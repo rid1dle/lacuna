@@ -24,7 +24,6 @@ pub struct Config {
     #[allow(dead_code)] // Read by Task 10's device names.
     pub devices: BTreeMap<IpAddr, String>,
     pub api: ApiConfig,
-    #[allow(dead_code)] // Read by Task 8's store.
     pub store: StoreConfig,
 }
 
@@ -92,11 +91,11 @@ pub struct ApiConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // Read by Task 8's store.
 pub struct StoreConfig {
     pub path: PathBuf,
     pub raw_days: u32,
     pub rollup_days: u32,
+    #[allow(dead_code)] // Read by Task 9's list manager.
     pub lists_dir: PathBuf,
 }
 

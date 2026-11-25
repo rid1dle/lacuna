@@ -12,6 +12,9 @@ serde = { version = "=1.0.229", default-features = false, features = ["derive", 
 # because the final image is `scratch` with no system certificate store.
 # `http2` is needed: Quad9 answers HTTP/1.1 DoH with 505.
 reqwest = { version = "=0.13.2", default-features = false, features = ["rustls-no-provider", "http2"] }
+# SQLite compiled in (no system library in a scratch image). No `cache` feature: the writer
+# prepares its statements once per batch instead, which avoids the hashlink dependency.
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 webpki-root-certs = { version = "=1.0.12", default-features = false }

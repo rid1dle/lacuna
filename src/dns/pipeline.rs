@@ -24,7 +24,6 @@ const CACHE_ENTRIES: usize = 20_000;
 
 /// One handled query, as the log writer stores it.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields are read by Task 8's writer; NoopSink drops them until then.
 pub struct QueryRecord {
     pub ts_ms: i64,
     pub client: IpAddr,
@@ -43,14 +42,16 @@ pub struct QueryRecord {
     pub answers: Vec<IpAddr>,
 }
 
-/// Where handled queries go. Task 8's writer implements it; `send` must never block.
+/// Where handled queries go: the store's `LogSender`. `send` must never block.
 pub trait LogSink: Send + Sync {
     fn send(&self, r: QueryRecord);
 }
 
-/// Drops every record (until the store exists).
+/// Drops every record.
+#[cfg(test)]
 pub struct NoopSink;
 
+#[cfg(test)]
 impl LogSink for NoopSink {
     fn send(&self, _: QueryRecord) {}
 }

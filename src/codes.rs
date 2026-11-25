@@ -12,10 +12,8 @@ macro_rules! coded_enum {
 
         impl $name {
             /// Every variant, for tests and for generating the SQL label views.
-            #[allow(dead_code)] // Task 8 generates the label views from it.
             pub const ALL: &'static [$name] = &[$($name::$variant),+];
 
-            #[allow(dead_code)] // Task 8's writer stores it.
             pub fn code(self) -> u8 {
                 self as u8
             }
@@ -30,7 +28,6 @@ macro_rules! coded_enum {
                 }
             }
 
-            #[allow(dead_code)] // Task 8 generates the label views from it.
             pub fn label(self) -> &'static str {
                 match self {
                     $($name::$variant => $label),+
