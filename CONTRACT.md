@@ -77,6 +77,7 @@ shape is shown in full once.
   "name": "sieve",
   "version": "0.1.0",
   "schemaVersion": 1,
+  "maxConcurrent": 2,
   "schema": [
     {
       "name": "queries",
@@ -108,7 +109,7 @@ shape is shown in full once.
           "id": "blocked_pct",
           "title": "Blocked %",
           "kind": "stat",
-          "sql": "SELECT\n  round(100.0 * sum(CASE WHEN outcome = 'blocked' THEN n ELSE 0 END)\n        / nullif(sum(n), 0), 1) AS blocked_pct,\n  coalesce(sum(n), 0) AS queries\nFROM (\n  ...\n)",
+          "sql": "-- [lo, hi): whole hours read from the hourly rollup. ...\nWITH lo AS (\n  ...\n),\nhi AS (\n  ...\n)\nSELECT\n  round(100.0 * sum(CASE WHEN outcome = 'blocked' THEN n ELSE 0 END)\n        / nullif(sum(n), 0), 1) AS blocked_pct,\n  coalesce(sum(n), 0) AS queries\nFROM (\n  ...\n)",
           "layout": { "x": 0, "y": 8, "w": 4, "h": 4 },
           "options": { "y": "blocked_pct" }
         }
@@ -125,6 +126,9 @@ shape is shown in full once.
   ]
 }
 ```
+
+`maxConcurrent` is how many queries sieve runs at once; see [Limits](#limits). It was
+added within `schemaVersion` 1, so treat it as optional and assume 1 when absent.
 
 ### schema
 
@@ -199,12 +203,16 @@ Option roles, each naming a result column (absent roles are not set):
 Any kind may also carry `refreshSeconds`: redraw that often while the page is open.
 In version 1 only `live.recent` sets it (5).
 
-Default panels follow two rules about time. Up to 24 hours they read the raw `queries`
-view (5-minute buckets for time series). Longer ranges read the `hourly` or `daily`
-rollups (hourly buckets up to 7 days, IST days beyond), plus the raw rows not rolled up
-yet, so the newest hours are never missing and nothing is counted twice. Over 24 hours,
-`daily`-based panels count whole IST days that start inside the range. Panels whose
-title says "last 30 days at most" read raw rows only, which are kept 30 days.
+Default panels count exactly the queries in `[from, to)`. Up to 24 hours they read the
+raw `queries` view (5-minute buckets for time series). Longer ranges read the `hourly`
+or `daily` rollups only for whole hours or IST days inside the range that are already
+rolled up, and raw rows for the partial hour or day at the start and everything after
+the last whole rolled-up bucket (time series use hourly buckets up to 7 days, IST days
+beyond). Nothing is missed or counted twice. One approximation: when `from` is older
+than the raw rows kept (30 days), the hour or day holding `from` is counted whole.
+Panels whose title says "last 30 days at most" read raw rows only.
+Each default panel's SQL starts with comment lines explaining this, so a cloned panel
+keeps the explanation.
 
 ### actions
 
@@ -313,7 +321,7 @@ Errors, all `400` unless noted:
 | Whole result | 8 MiB, counted as rows are read (32 bytes per value plus its text) | 400 |
 | Function references in the SQL | 64 (calls inside the views do not count) | 400 |
 | Time | 5 s (`api.query_timeout_ms`), approximate | 400 |
-| Queries at once | 2 (`api.max_concurrent`) | wait up to 2 s, then 429 `busy` |
+| Queries at once | 2 (`api.max_concurrent`, sent as the manifest's `maxConcurrent`) | wait up to 2 s, then 429 `busy` |
 
 The time limit is checked between steps of SQLite's work, and one step can be one long
 function call, so a hostile query can overrun it. The worst measured: 64 expensive calls
@@ -325,7 +333,11 @@ promptly. A client that takes no data for 30 s has the response cut off (it will
 parse) and the slot freed. Set the consumer's HTTP timeout for this call to at least
 15 s (2 s queueing + 5 s limit + overrun + transfer).
 
-Queries run on their own threads, at most two at a time, and never hold up DNS.
+Queries run on their own threads, at most `maxConcurrent` (from the manifest) at a
+time, and never hold up DNS. Send at most `maxConcurrent` queries at once: a dashboard
+with more panels than that should queue its panel queries rather than fire them all.
+On 429 `busy`, retry that query after a backoff (for example 0.5 s, then 1 s, then
+2 s), and give up and show the error after a few tries.
 
 ## POST /integration/actions/{id}
 
@@ -344,15 +356,20 @@ the action did not do what was asked; the message says why. An unknown action id
 | `resume` | none | Ends a pause |
 | `refresh_lists` | none | Fetches every enabled list now and rebuilds the rules. Waits for the fetch (up to 30 s per list) |
 | `reload_config` | none | Re-reads `config.toml`; see below |
-| `test_domain` | `name`: text | Says what sieve would do with that name now |
+| `test_domain` | `name`: text | Says which refused names, rewrites and rules match the name now (CNAME targets are not followed) |
 
 `reload_config` applies the lists, user rules, rewrites, refused names, blocked TTL and
-device names, rebuilding the rules from the list copies on disk (no fetch). If the file
-does not load or fails validation, nothing changes and the answer is `ok: false` with
-the error. Upstreams, listen addresses and the `[api]` and `[store]` sections need a
+device names, rebuilding the rules from the list copies on disk. A list that is new to
+the running config (added, enabled, or moved to another URL) has no usable copy yet:
+those are fetched in the background, the message ends with `; refreshing N new lists`,
+and they block once the fetch is done (seconds; up to 30 s per list). If the file does
+not load or fails validation, nothing changes and the answer is `ok: false` with the
+error. Upstreams, listen addresses and the `[api]` and `[store]` sections need a
 restart.
 
-`test_domain` checks in DNS order: refused names, rewrites, then the rules. Messages:
+`test_domain` checks the name itself in DNS order: refused names, rewrites, then the
+rules. It does not resolve the name, so a block that DNS would make on a CNAME target
+does not show. Messages:
 `allowed`, `allowed by <rule> (<list>)`, `blocked by <rule> (<list>)`,
 `answered <ip> by <rule> (<list>)`, `rewritten to <ip>`,
 `refused: sieve never answers this name`. During a pause a blocking verdict reads

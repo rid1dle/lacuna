@@ -54,6 +54,12 @@ const CHUNKS_QUEUED: usize = 4;
 const STALLED_CLIENT: Duration = Duration::from_secs(30);
 const MAX_NAME_BYTES: usize = 253;
 
+/// Held for the whole of every CPU- or timing-heavy test (here and in `readonly`), so
+/// those never run at the same time and squeeze each other's time limits. A tokio mutex,
+/// so async tests can hold it across `.await`; sync tests take it with `blocking_lock`.
+#[cfg(test)]
+pub(crate) static HEAVY_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// What the actions act on: the running DNS state and where the config lives.
 pub struct Runtime<F: Fetch, U: Upstream> {
     pub config_path: PathBuf,
@@ -88,8 +94,8 @@ impl<F: Fetch, U: Upstream> ApiState<F, U> {
         max_concurrent: usize,
         runtime: Runtime<F, U>,
     ) -> Self {
-        let manifest =
-            serde_json::to_vec(&manifest::manifest()).expect("the manifest is plain data");
+        let manifest = serde_json::to_vec(&manifest::manifest(max_concurrent))
+            .expect("the manifest is plain data");
         ApiState {
             secret,
             store,
@@ -348,7 +354,7 @@ struct ActionRequest {
     params: Map<String, Value>,
 }
 
-async fn action<F: Fetch, U: Upstream + 'static>(
+async fn action<F: Fetch + 'static, U: Upstream + 'static>(
     State(s): AppState<F, U>,
     UrlPath(id): UrlPath<String>,
     body: Body,
@@ -401,9 +407,10 @@ fn pause<F: Fetch, U: Upstream + 'static>(
 }
 
 /// Re-reads config.toml and applies what can change while running: lists and user
-/// rules (rebuilt from the bodies on disk, no fetch), rewrites, refused names, blocked
-/// TTL and device names. A config that does not load changes nothing.
-async fn reload_config<F: Fetch, U: Upstream>(rt: &Runtime<F, U>) -> (bool, String) {
+/// rules (rebuilt from the bodies on disk), rewrites, refused names, blocked TTL and
+/// device names. Lists newly in force are fetched in the background. A config that does
+/// not load changes nothing.
+async fn reload_config<F: Fetch + 'static, U: Upstream>(rt: &Runtime<F, U>) -> (bool, String) {
     let config = match Config::load(&rt.config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -413,16 +420,19 @@ async fn reload_config<F: Fetch, U: Upstream>(rt: &Runtime<F, U>) -> (bool, Stri
             )
         }
     };
-    if let Err(e) = rt
+    let fresh = match rt
         .lists
         .set_config(config.lists.clone(), config.user_rules.clone())
         .await
     {
-        return (
-            false,
-            format!("rule set not rebuilt, the running rules stay: {e:#}"),
-        );
-    }
+        Ok(fresh) => fresh,
+        Err(e) => {
+            return (
+                false,
+                format!("rule set not rebuilt, the running rules stay: {e:#}"),
+            )
+        }
+    };
     // Replaced whole, never edited in place: a query in flight keeps the Arc it read.
     *rt.live.write().unwrap_or_else(PoisonError::into_inner) =
         Arc::new(LiveConfig::from_config(&config));
@@ -443,6 +453,19 @@ async fn reload_config<F: Fetch, U: Upstream>(rt: &Runtime<F, U>) -> (bool, Stri
         Err(e) => {
             let _ = write!(message, "; device names not saved: {e}");
         }
+    }
+    // Their bodies on disk are missing or from the old URL. Not awaited: a fetch can
+    // take 30 s per list. The refresh lock queues it behind any refresh running.
+    if !fresh.is_empty() {
+        let plural = if fresh.len() == 1 { "" } else { "s" };
+        let _ = write!(message, "; refreshing {} new list{plural}", fresh.len());
+        let lists = Arc::clone(&rt.lists);
+        tokio::spawn(async move {
+            // Not inside `info!`: tracing skips a macro's arguments when the level is
+            // off, and the refresh would never run.
+            let report = lists.refresh().await;
+            info!("{}", report.summary());
+        });
     }
     message.push_str(
         ". Upstreams, listen addresses and the [api] and [store] sections apply at the next \
@@ -532,18 +555,30 @@ mod tests {
     const DEPLOY: &str = include_str!("../../deploy/config.toml");
     const LIST_NAME: &str = "AdGuard DNS filter";
 
-    /// Lists in these tests are never fetched.
-    struct NoFetch;
+    /// Serves the bodies set in it by URL; any other URL fails.
+    #[derive(Clone, Default)]
+    struct TestFetch(Arc<std::sync::Mutex<BTreeMap<String, String>>>);
 
-    impl Fetch for NoFetch {
-        async fn fetch(&self, _: &str) -> Result<String, String> {
-            Err("offline in tests".into())
+    impl TestFetch {
+        fn serve(&self, url: &str, body: &str) {
+            self.0.lock().unwrap().insert(url.into(), body.into());
         }
     }
 
+    impl Fetch for TestFetch {
+        async fn fetch(&self, url: &str) -> Result<String, String> {
+            let body = self.0.lock().unwrap().get(url).cloned();
+            body.ok_or_else(|| "offline in tests".to_string())
+        }
+    }
+
+    /// List 1 in deploy/config.toml, so reloading that file does not move it.
+    const LIST_1_URL: &str = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";
+
     struct Rig {
-        state: Arc<ApiState<NoFetch, Fake>>,
+        state: Arc<ApiState<TestFetch, Fake>>,
         app: Router,
+        fetch: TestFetch,
         db: TempDb,
         /// Holds the config file and the lists dir; removed on drop.
         dir: PathBuf,
@@ -595,18 +630,19 @@ mod tests {
         std::fs::write(&config_path, DEPLOY).unwrap();
 
         let rules = shared(RuleSet::default());
+        let fetch = TestFetch::default();
         let lists = Arc::new(Lists::new(
             vec![ListConfig {
                 id: 1,
                 name: LIST_NAME.into(),
-                url: "https://lists.test/1.txt".into(),
+                url: LIST_1_URL.into(),
                 enabled: true,
             }],
             vec![],
             dir.join("lists"),
             db.0.clone(),
             Arc::clone(&rules),
-            NoFetch,
+            fetch.clone(),
         ));
         let live = shared(live());
         let fake = Arc::new(State::default());
@@ -633,6 +669,7 @@ mod tests {
         state.stall = setup.stall;
         let state = Arc::new(state);
         Rig {
+            fetch,
             app: router(Arc::clone(&state)),
             state,
             db,
@@ -768,6 +805,7 @@ mod tests {
         assert_eq!(m["name"], "sieve");
         assert_eq!(m["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(m["schemaVersion"], 1);
+        assert_eq!(m["maxConcurrent"], 2);
         let ids = |v: &Value, key: &str| -> Vec<String> {
             v.as_array()
                 .unwrap()
@@ -854,7 +892,7 @@ mod tests {
         let db = TempDb::new("schema");
         drop(Store::open(&db.0).unwrap());
         let conn = rusqlite::Connection::open(&db.0).unwrap();
-        for view in manifest().schema {
+        for view in manifest(2).schema {
             let stmt = conn
                 .prepare(&format!("SELECT * FROM {}", view.name))
                 .unwrap();
@@ -866,12 +904,15 @@ mod tests {
 
     /// 2026-11-25T19:00:00Z.
     const END: i64 = 1_795_633_200_000;
+    const MIN: i64 = 60_000;
     const HOUR: i64 = 3_600_000;
+    const DAY: i64 = 24 * HOUR;
     const LAPTOP: &str = "192.168.0.10";
 
     /// 50 queries, one every 90 minutes up to END, across three clients and five kinds
-    /// of answer. The rollups run as of six hours before END, so they hold most rows and
-    /// the newest are raw only, as in production.
+    /// of answer, plus one hit of `||partial.test^` in MID_A's leading partial hour (and
+    /// so its leading partial day). The rollups run as of six hours before END, so they hold most rows and the
+    /// newest are raw only, as in production.
     fn seed(db: &Path) -> Vec<QueryRecord> {
         let clients = [LAPTOP, "192.168.0.20", "192.168.0.30"];
         let blocked = |ts, client, name| QueryRecord {
@@ -882,7 +923,7 @@ mod tests {
             served_from: ServedFrom::Local,
             ..record(ts, client, name)
         };
-        let records: Vec<QueryRecord> = (0..50)
+        let mut records: Vec<QueryRecord> = (0..50)
             .map(|i| {
                 let ts = END - (50 - i) * 90 * 60_000;
                 let client = clients[i as usize % 3];
@@ -904,6 +945,10 @@ mod tests {
                 }
             })
             .collect();
+        records.push(QueryRecord {
+            rule: Some("||partial.test^".into()),
+            ..blocked(MID_A.from + 10 * MIN, LAPTOP, "partial.test")
+        });
         let store = Store::open(db).unwrap();
         let mut conn = rusqlite::Connection::open(db).unwrap();
         let tx = conn.transaction().unwrap();
@@ -911,7 +956,7 @@ mod tests {
         tx.execute_batch(&format!(
             "UPDATE client_names SET name = 'laptop', origin = 'config' WHERE ip = '{LAPTOP}';
              INSERT INTO list_meta (id, name, url, enabled, parsed, skipped_json, fetched_at)
-             VALUES (1, '{LIST_NAME}', 'https://lists.test/1.txt', 1, 2, '{{}}', {END});
+             VALUES (1, '{LIST_NAME}', '{LIST_1_URL}', 1, 2, '{{}}', {END});
              INSERT INTO rule_texts (list_id, text) VALUES (1, '||never.test^');"
         ))
         .unwrap();
@@ -930,11 +975,25 @@ mod tests {
         from: END - 24 * HOUR,
         to: END,
     };
-    /// The rollups plus the raw tail. Starts before the IST day of the oldest row, since
-    /// over 24 hours whole days are counted from their start.
+    /// The rollups plus the raw tail; starts before the oldest row.
     const LONG: Range = Range {
-        from: END - 7 * 24 * HOUR,
+        from: END - 7 * DAY,
         to: END + HOUR,
+    };
+    /// Start mid-hour and mid-IST-day, end in the past mid-day: partial buckets at both
+    /// ends. MID_A ends after the daily rollup's edge, MID_B before it.
+    const MID_A: Range = Range {
+        from: END - 60 * HOUR - 17 * MIN,
+        to: END - 20 * HOUR - 7 * MIN,
+    };
+    const MID_B: Range = Range {
+        from: END - 70 * HOUR + 13 * MIN,
+        to: END - 30 * HOUR - 7 * MIN,
+    };
+    /// Over 7 days (day buckets), ending mid-hour after the hourly rollup's edge.
+    const WEEK_PLUS: Range = Range {
+        from: END - 8 * DAY - 5 * HOUR - 13 * MIN,
+        to: END - 2 * HOUR - 29 * MIN,
     };
 
     fn params(range: &Range, client: Option<&str>, domain: Option<&str>) -> Value {
@@ -967,8 +1026,8 @@ mod tests {
     async fn every_default_panel_runs() {
         let r = rig("panels", Setup::default());
         let records = seed(&r.db.0);
-        let m = manifest();
-        for range in [&SHORT, &LONG] {
+        let m = manifest(2);
+        for range in [&SHORT, &LONG, &MID_A, &MID_B, &WEEK_PLUS] {
             for client in [None, Some(LAPTOP)] {
                 let picked: Vec<&QueryRecord> = records
                     .iter()
@@ -981,6 +1040,11 @@ mod tests {
                     .filter(|q| q.outcome == Outcome::Blocked)
                     .count() as i64;
                 assert!(expected >= 5, "the seed covers the range: {expected}");
+                let mut never: Vec<&str> = ["||adnet.com^", "||never.test^", "||partial.test^"]
+                    .into_iter()
+                    .filter(|rule| !picked.iter().any(|q| q.rule.as_deref() == Some(*rule)))
+                    .collect();
+                never.sort_unstable();
 
                 let mut frames = BTreeMap::new();
                 for d in &m.dashboards {
@@ -995,25 +1059,33 @@ mod tests {
                         frames.insert(p.id, frame);
                     }
                 }
-                // Rollups plus the raw tail count every query exactly once.
-                assert_eq!(sum(&frames["queries_over_time"], "n"), expected);
-                assert_eq!(sum(&frames["by_device"], "n"), expected);
-                assert_eq!(sum(&frames["device_timeline"], "n"), expected);
-                assert_eq!(sum(&frames["top_domains"], "n"), expected);
-                assert_eq!(sum(&frames["device_top_domains"], "n"), expected);
-                assert_eq!(sum(&frames["blocked_pct"], "queries"), expected);
+                // Rollups plus raw rows at the edges count every query exactly once.
+                let ctx = format!("from {} to {} client {client:?}", range.from, range.to);
+                assert_eq!(sum(&frames["queries_over_time"], "n"), expected, "{ctx}");
+                assert_eq!(sum(&frames["by_device"], "n"), expected, "{ctx}");
+                assert_eq!(sum(&frames["device_timeline"], "n"), expected, "{ctx}");
+                assert_eq!(sum(&frames["top_domains"], "n"), expected, "{ctx}");
+                // Daily-based and hourly-based panels on one dashboard agree.
+                assert_eq!(
+                    sum(&frames["device_top_domains"], "n"),
+                    sum(&frames["by_device"], "n"),
+                    "{ctx}"
+                );
+                assert_eq!(sum(&frames["blocked_pct"], "queries"), expected, "{ctx}");
                 let pct = (1000.0 * blocked as f64 / expected as f64).round() / 10.0;
                 assert_eq!(column(&frames["blocked_pct"], "blocked_pct"), [json!(pct)]);
-                assert_eq!(sum(&frames["top_blocked"], "n"), blocked);
-                assert_eq!(sum(&frames["top_rules"], "n"), blocked);
+                assert_eq!(sum(&frames["top_blocked"], "n"), blocked, "{ctx}");
+                assert_eq!(sum(&frames["top_rules"], "n"), blocked, "{ctx}");
                 assert_eq!(column(&frames["log_dropped"], "dropped"), [json!(0)]);
                 assert_eq!(column(&frames["cache_hit_rate"], "cache_hit_pct").len(), 1);
                 assert!(!column(&frames["upstream_latency"], "avg_ms").is_empty());
                 assert_eq!(column(&frames["lists_table"], "name"), [json!(LIST_NAME)]);
-                assert_eq!(
-                    column(&frames["never_hit"], "rule"),
-                    [json!("||never.test^")]
-                );
+                let mut never_hit: Vec<String> = column(&frames["never_hit"], "rule")
+                    .into_iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect();
+                never_hit.sort_unstable();
+                assert_eq!(never_hit, never, "{ctx}");
                 let recent = frames["recent"]["rows"].as_array().unwrap().len();
                 assert_eq!(recent as i64, expected.min(200));
                 if client.is_some() {
@@ -1038,6 +1110,31 @@ mod tests {
         assert!(domains.contains(&json!("adnet.com")));
         assert!(domains.contains(&json!("track.adnet.com")));
         assert_eq!(column(&frame, "list")[0], LIST_NAME);
+
+        // Once raw rows are gone (past retention), the leading partial day can only come
+        // from the rollup: the whole day is counted, the one documented approximation.
+        let cut = MID_A.from + 2 * HOUR;
+        rusqlite::Connection::open(&r.db.0)
+            .unwrap()
+            .execute("DELETE FROM raw_queries WHERE ts < ?1", [cut])
+            .unwrap();
+        let day_start = MID_A.from - (MID_A.from + 19_800_000).rem_euclid(DAY);
+        let whole_day = records
+            .iter()
+            .filter(|q| q.ts_ms >= day_start && q.ts_ms < MID_A.to)
+            .count() as i64;
+        let in_range = records
+            .iter()
+            .filter(|q| q.ts_ms >= MID_A.from && q.ts_ms < MID_A.to)
+            .count() as i64;
+        assert!(
+            whole_day > in_range,
+            "the seed has rows before MID_A.from that day"
+        );
+        let top = m.dashboards[2].panels[0].sql;
+        let (status, frame) = r.query(top, params(&MID_A, None, None)).await;
+        assert_eq!(status, StatusCode::OK, "{frame}");
+        assert_eq!(sum(&frame, "n"), whole_day);
     }
 
     /// No default panel reads one of the big tables end to end, at either range length.
@@ -1076,7 +1173,7 @@ mod tests {
         ] {
             assert!(scans_big(&plan(sql, &SHORT)), "{sql}");
         }
-        for d in manifest().dashboards {
+        for d in manifest(2).dashboards {
             for p in d.panels {
                 for range in [&SHORT, &LONG] {
                     let steps = plan(p.sql, range);
@@ -1088,6 +1185,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_errors_are_400() {
+        let _heavy = HEAVY_TEST.lock().await;
         let r = rig(
             "errors",
             Setup {
@@ -1191,6 +1289,7 @@ mod tests {
     /// A client that hangs up, or stops reading, gives its query slot back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gone_or_stalled_clients_free_their_slot() {
+        let _heavy = HEAVY_TEST.lock().await;
         let r = rig(
             "stall",
             Setup {
@@ -1366,6 +1465,58 @@ mod tests {
         assert_eq!(name, "tv");
     }
 
+    /// Ruling R29: a reload that adds a list, or moves one to a new URL, fetches it in
+    /// the background instead of waiting for the daily refresh.
+    #[tokio::test]
+    async fn reload_fetches_new_and_moved_lists() {
+        let r = rig("newlists", Setup::default());
+        r.load_lists().await;
+        let new_url = "https://lists.test/3.txt";
+        r.fetch.serve(new_url, "||newlist.test^\n");
+        let added = DEPLOY.replacen(
+            "[[rewrites]]",
+            &format!(
+                "[[lists]]\nid = 3\nname = \"New\"\nurl = \"{new_url}\"\nenabled = true\n\n\
+                 [[rewrites]]"
+            ),
+            1,
+        );
+        assert_ne!(added, DEPLOY);
+        let path = &r.state.runtime.config_path;
+        std::fs::write(path, &added).unwrap();
+        let (ok, message) = r.act("reload_config", json!({})).await;
+        assert!(ok, "{message}");
+        assert!(message.contains("refreshing 1 new list"), "{message}");
+        let verdict = || r.act("test_domain", json!({ "name": "newlist.test" }));
+        let mut waited = 0;
+        while verdict().await.1 == "allowed" {
+            assert!(waited < 200, "the new list was not fetched");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        assert_eq!(verdict().await.1, "blocked by ||newlist.test^ (New)");
+
+        // Reloading the same file again fetches nothing.
+        let (ok, message) = r.act("reload_config", json!({})).await;
+        assert!(ok && !message.contains("refreshing"), "{message}");
+
+        // List 1 moves: its old body is dropped and the new URL is fetched.
+        let moved_url = "https://lists.test/1-moved.txt";
+        r.fetch.serve(moved_url, "||moved.test^\n");
+        std::fs::write(path, added.replace(LIST_1_URL, moved_url)).unwrap();
+        let (ok, message) = r.act("reload_config", json!({})).await;
+        assert!(ok && message.contains("refreshing 1 new list"), "{message}");
+        let moved = || r.act("test_domain", json!({ "name": "moved.test" }));
+        let mut waited = 0;
+        while moved().await.1 == "allowed" {
+            assert!(waited < 200, "the moved list was not fetched");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        let (_, old) = r.act("test_domain", json!({ "name": "adnet.com" })).await;
+        assert_eq!(old, "allowed");
+    }
+
     #[tokio::test]
     async fn every_manifest_action_is_handled() {
         let r = rig("actions", Setup::default());
@@ -1396,6 +1547,7 @@ mod tests {
     /// holds up DNS, which answers on the async workers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dns_answers_during_slow_query() {
+        let _heavy = HEAVY_TEST.lock().await;
         let r = rig(
             "slow",
             Setup {
@@ -1464,6 +1616,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn two_worst_queries_peak_rss() {
+        let _heavy = HEAVY_TEST.lock().await;
         fn status_kib(key: &str) -> i64 {
             let status = std::fs::read_to_string("/proc/self/status").unwrap();
             status

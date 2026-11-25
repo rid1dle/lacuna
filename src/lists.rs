@@ -245,20 +245,41 @@ impl<F: Fetch> Lists<F> {
     }
 
     /// Replaces the list configs and user rules (a config reload) and applies them at
-    /// once: `list_meta` rows, then a rebuild from the bodies on disk. Waits for a
-    /// refresh in flight, which would otherwise finish with the old config after this
-    /// returns: saving a body fetched from a URL the reload moved away from, and swapping
-    /// in a set built from the old user rules.
-    pub async fn set_config(&self, lists: Vec<ListConfig>, user_rules: Vec<String>) -> Result<()> {
+    /// once: `list_meta` rows, then a rebuild from the bodies on disk, and its stats.
+    /// Waits for a refresh in flight, which would otherwise finish with the old config
+    /// after this returns: saving a body fetched from a URL the reload moved away from,
+    /// and swapping in a set built from the old user rules.
+    ///
+    /// Returns the ids of lists newly in force (added, enabled, or moved to a new URL),
+    /// whose bodies on disk are missing or stale: the caller has them fetched.
+    pub async fn set_config(
+        &self,
+        lists: Vec<ListConfig>,
+        user_rules: Vec<String>,
+    ) -> Result<Vec<u32>> {
         let _one_at_a_time = self.refresh_lock.lock().await;
+        let old = self.conf();
+        let fresh: Vec<u32> = lists
+            .iter()
+            .filter(|l| l.enabled)
+            .filter(|l| {
+                !old.lists
+                    .iter()
+                    .any(|o| o.id == l.id && o.enabled && o.url == l.url)
+            })
+            .map(|l| l.id)
+            .collect();
         *self.conf.write().unwrap_or_else(PoisonError::into_inner) =
             Arc::new(Conf { lists, user_rules });
         // A failed rebuild leaves this None, so the next refresh rebuilds.
         *self.built.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.sync_meta().await;
         let (set, stats) = self.rebuild().await?;
+        // Without this, `list_meta` keeps the counts of the old build until a refresh
+        // finds a changed body.
+        self.store_stats(&stats).await;
         self.swap(set, stats);
-        Ok(())
+        Ok(fresh)
     }
 
     /// The configured name of list `id`; list 0 is the user rules.
@@ -1016,6 +1037,31 @@ mod tests {
         reload.await.unwrap();
         assert!(!r.blocks("old-url.test"));
         assert!(!r.dir.join("1.txt").exists());
+    }
+
+    /// The lists view shows the rules in force: a reload that brings a list into force
+    /// from its file on disk records that list's count.
+    #[tokio::test]
+    async fn set_config_stores_list_stats() {
+        let r = rig("stats");
+        std::fs::create_dir_all(&r.dir).unwrap();
+        std::fs::write(r.dir.join("2.txt"), "||a.test^\n||b.test^\n/re/\n").unwrap();
+        r.lists
+            .set_config(
+                vec![cfg(1, "First", URL1, true), cfg(2, "Second", URL2, true)],
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(r.blocks("b.test"));
+        assert_eq!(
+            r.sql::<i64>("SELECT parsed FROM list_meta WHERE id = 2"),
+            Some(2)
+        );
+        assert_eq!(
+            r.sql::<String>("SELECT skipped_json FROM list_meta WHERE id = 2"),
+            Some(r#"{"regex":1}"#.to_string())
+        );
     }
 
     #[tokio::test]

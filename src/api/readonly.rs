@@ -729,6 +729,7 @@ mod tests {
 
     #[test]
     fn runaway_query_is_stopped() {
+        let _heavy = crate::api::HEAVY_TEST.blocking_lock();
         let f = Fixture::new();
         let forever = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n)
                        SELECT count(*) FROM n";
@@ -839,6 +840,7 @@ mod tests {
 
     #[test]
     fn stacked_expensive_calls_are_stopped() {
+        let _heavy = crate::api::HEAVY_TEST.blocking_lock();
         // Each instr runs inside one VM step. Row after row, the progress handler and the
         // per-row deadline stop them.
         let f = Fixture::new();
@@ -863,7 +865,8 @@ mod tests {
             let r = f.run_with(&sql, &p, limits);
             let took = started.elapsed();
             assert_eq!(r, Err(QueryError::Timeout), "{sql}");
-            assert!(took < Duration::from_secs(2), "{took:?}: {sql}");
+            // The 64-call row measures about 1.07 s; unbounded it would run ~38 min.
+            assert!(took < Duration::from_secs(3), "{took:?}: {sql}");
         }
     }
 

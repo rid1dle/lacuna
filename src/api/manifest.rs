@@ -2,16 +2,19 @@
 //! views with their columns, the variables, the default dashboards (SQL panels written
 //! against the views only) and the actions.
 //!
-//! Every panel's SQL is a standalone query a user may clone and edit, so each one is
-//! written out in full rather than assembled from shared fragments.
+//! Every panel's SQL is a standalone query a user may clone and edit. In this source
+//! the range prelude shared by several panels is a macro, but the text shipped is whole.
 //!
-//! Time ranges: up to 24 hours, panels read the raw `queries` view. Longer ranges read
-//! the `hourly` or `daily` rollup for the hours or days already rolled up, plus raw rows
-//! after the last rolled-up one, so the newest hours are never missing. The edge is
-//! `max(hour_ts) + 1 hour` (or `max(day_ts) + 1 day`); every raw row after it is still
-//! in the log, since rollups lag by at most a day and raw rows are kept 30 days. The
-//! raw part's lower bound is written as one `ts >= max(...)` term so the `ts` index
-//! starts there instead of scanning the rolled-up range.
+//! Time ranges are exact, half open `[:from, :to)`. Up to 24 hours, panels read the raw
+//! `queries` view. Longer ranges read the `hourly` or `daily` rollup only for whole
+//! buckets inside the range that are rolled up (`[lo, hi)`), and raw rows for the
+//! partial bucket at the start and everything from `hi` on. `hi` is capped at the
+//! rollup's edge, `max(hour_ts) + 1 hour` (or `max(day_ts) + 1 day`); every raw row
+//! after it is still in the log, since rollups lag by at most a day and raw rows are
+//! kept 30 days. Only when raw rows no longer reach back to `:from` (past raw
+//! retention) is the leading bucket taken whole from the rollup, an overcount of at
+//! most one bucket. Each part is one index range: `lo` and `hi` are constant
+//! subqueries, so the `ts`, `hour_ts` and `day_ts` indexes bound every scan.
 
 use serde::Serialize;
 
@@ -24,6 +27,8 @@ pub struct Manifest {
     pub name: &'static str,
     pub version: &'static str,
     pub schema_version: u32,
+    /// Queries sieve runs at once (`api.max_concurrent`); more wait, then get 429.
+    pub max_concurrent: usize,
     pub schema: Vec<View>,
     pub variables: Vec<Variable>,
     pub dashboards: Vec<Dashboard>,
@@ -164,11 +169,12 @@ impl ActionId {
     }
 }
 
-pub fn manifest() -> Manifest {
+pub fn manifest(max_concurrent: usize) -> Manifest {
     Manifest {
         name: "sieve",
         version: env!("CARGO_PKG_VERSION"),
         schema_version: SCHEMA_VERSION,
+        max_concurrent,
         schema: schema(),
         variables: vec![
             Variable {
@@ -610,8 +616,104 @@ fn dashboards() -> Vec<Dashboard> {
     ]
 }
 
+macro_rules! hourly_edges {
+    () => {
+        "\
+-- [lo, hi): whole hours read from the hourly rollup. Raw rows cover [:from, lo) and
+-- [hi, :to). Up to 24 hours everything is raw. Past raw retention, lo is the hour
+-- holding :from, counted whole.
+WITH lo AS (
+  SELECT CASE
+    WHEN :to - :from <= 86400000 THEN :to
+    WHEN :from < (SELECT coalesce(min(ts), :to) FROM queries)
+      THEN :from - :from % 3600000
+    ELSE :from + 3599999 - (:from + 3599999) % 3600000
+  END AS ts
+),
+hi AS (
+  SELECT max((SELECT ts FROM lo), min(:to - :to % 3600000,
+    (SELECT coalesce(max(hour_ts) + 3600000, 0) FROM hourly))) AS ts
+)
+"
+    };
+}
+
+macro_rules! daily_edges {
+    () => {
+        "\
+-- [lo, hi): whole IST days read from the daily rollup. Raw rows cover [:from, lo) and
+-- [hi, :to). Up to 24 hours everything is raw. Past raw retention, lo is the day
+-- holding :from, counted whole.
+WITH lo AS (
+  SELECT CASE
+    WHEN :to - :from <= 86400000 THEN :to
+    WHEN :from < (SELECT coalesce(min(ts), :to) FROM queries)
+      THEN :from - (:from + 19800000) % 86400000
+    ELSE :from + 86399999 - (:from + 86399999 + 19800000) % 86400000
+  END AS ts
+),
+hi AS (
+  SELECT max((SELECT ts FROM lo), min(:to - (:to + 19800000) % 86400000,
+    (SELECT coalesce(max(day_ts) + 86400000, 0) FROM daily))) AS ts
+)
+"
+    };
+}
+
+/// The three parts of a range for the hourly view: `$cols` from the rollup, `$raw`
+/// (the same columns) from raw rows at either end, each with `$filter` added.
+macro_rules! hourly_parts {
+    ($cols:literal, $raw:literal, $filter:literal) => {
+        concat!(
+            "  SELECT ",
+            $cols,
+            "\n  FROM hourly\n",
+            "  WHERE hour_ts >= (SELECT ts FROM lo) AND hour_ts < (SELECT ts FROM hi)\n",
+            $filter,
+            "  UNION ALL\n",
+            "  SELECT ",
+            $raw,
+            "\n  FROM queries\n",
+            "  WHERE ts >= :from AND ts < (SELECT ts FROM lo)\n",
+            $filter,
+            "  UNION ALL\n",
+            "  SELECT ",
+            $raw,
+            "\n  FROM queries\n",
+            "  WHERE ts >= (SELECT ts FROM hi) AND ts < :to\n",
+            $filter,
+        )
+    };
+}
+
+macro_rules! daily_parts {
+    ($cols:literal, $raw:literal, $filter:literal) => {
+        concat!(
+            "  SELECT ",
+            $cols,
+            "\n  FROM daily\n",
+            "  WHERE day_ts >= (SELECT ts FROM lo) AND day_ts < (SELECT ts FROM hi)\n",
+            $filter,
+            "  UNION ALL\n",
+            "  SELECT ",
+            $raw,
+            "\n  FROM queries\n",
+            "  WHERE ts >= :from AND ts < (SELECT ts FROM lo)\n",
+            $filter,
+            "  UNION ALL\n",
+            "  SELECT ",
+            $raw,
+            "\n  FROM queries\n",
+            "  WHERE ts >= (SELECT ts FROM hi) AND ts < :to\n",
+            $filter,
+        )
+    };
+}
+
 // Buckets: 5 minutes up to 24 hours, hours up to 7 days, IST days beyond.
-const QUERIES_OVER_TIME: &str = "\
+const QUERIES_OVER_TIME: &str = concat!(
+    hourly_edges!(),
+    "\
 SELECT
   CASE
     WHEN :to - :from <= 86400000 THEN t - t % 300000
@@ -621,43 +723,33 @@ SELECT
   outcome,
   sum(n) AS n
 FROM (
-  SELECT hour_ts AS t, outcome, n
-  FROM hourly
-  WHERE :to - :from > 86400000
-    AND hour_ts >= :from AND hour_ts < :to
-    AND hour_ts < (SELECT coalesce(max(hour_ts) + 3600000, 0) FROM hourly)
-    AND (:client IS NULL OR client = :client)
-  UNION ALL
-  SELECT ts AS t, outcome, 1 AS n
-  FROM queries
-  WHERE ts >= max(:from, CASE WHEN :to - :from > 86400000
-          THEN (SELECT coalesce(max(hour_ts) + 3600000, 0) FROM hourly) ELSE 0 END)
-    AND ts < :to
-    AND (:client IS NULL OR client = :client)
-)
+",
+    hourly_parts!(
+        "hour_ts AS t, outcome, n",
+        "ts AS t, outcome, 1 AS n",
+        "    AND (:client IS NULL OR client = :client)\n"
+    ),
+    ")
 GROUP BY 1, 2
-ORDER BY 1, 2";
+ORDER BY 1, 2"
+);
 
-const BLOCKED_PCT: &str = "\
+const BLOCKED_PCT: &str = concat!(
+    hourly_edges!(),
+    "\
 SELECT
   round(100.0 * sum(CASE WHEN outcome = 'blocked' THEN n ELSE 0 END)
         / nullif(sum(n), 0), 1) AS blocked_pct,
   coalesce(sum(n), 0) AS queries
 FROM (
-  SELECT outcome, n
-  FROM hourly
-  WHERE :to - :from > 86400000
-    AND hour_ts >= :from AND hour_ts < :to
-    AND hour_ts < (SELECT coalesce(max(hour_ts) + 3600000, 0) FROM hourly)
-    AND (:client IS NULL OR client = :client)
-  UNION ALL
-  SELECT outcome, 1 AS n
-  FROM queries
-  WHERE ts >= max(:from, CASE WHEN :to - :from > 86400000
-          THEN (SELECT coalesce(max(hour_ts) + 3600000, 0) FROM hourly) ELSE 0 END)
-    AND ts < :to
-    AND (:client IS NULL OR client = :client)
-)";
+",
+    hourly_parts!(
+        "outcome, n",
+        "outcome, 1 AS n",
+        "    AND (:client IS NULL OR client = :client)\n"
+    ),
+    ")"
+);
 
 // Of the answers not made locally, the share served from the cache. Raw rows only.
 const CACHE_HIT_RATE: &str = "\
@@ -690,27 +782,25 @@ WHERE ts >= :from AND ts < :to
 GROUP BY 1
 ORDER BY 1";
 
-const BY_DEVICE: &str = "\
+const BY_DEVICE: &str = concat!(
+    hourly_edges!(),
+    "\
 SELECT device, outcome, sum(n) AS n
 FROM (
-  SELECT client, device, outcome, n
-  FROM hourly
-  WHERE :to - :from > 86400000
-    AND hour_ts >= :from AND hour_ts < :to
-    AND hour_ts < (SELECT coalesce(max(hour_ts) + 3600000, 0) FROM hourly)
-    AND (:client IS NULL OR client = :client)
-  UNION ALL
-  SELECT client, device, outcome, 1 AS n
-  FROM queries
-  WHERE ts >= max(:from, CASE WHEN :to - :from > 86400000
-          THEN (SELECT coalesce(max(hour_ts) + 3600000, 0) FROM hourly) ELSE 0 END)
-    AND ts < :to
-    AND (:client IS NULL OR client = :client)
-)
+",
+    hourly_parts!(
+        "client, device, outcome, n",
+        "client, device, outcome, 1 AS n",
+        "    AND (:client IS NULL OR client = :client)\n"
+    ),
+    ")
 GROUP BY client, outcome
-ORDER BY device, outcome";
+ORDER BY device, outcome"
+);
 
-const DEVICE_TIMELINE: &str = "\
+const DEVICE_TIMELINE: &str = concat!(
+    hourly_edges!(),
+    "\
 SELECT
   CASE
     WHEN :to - :from <= 86400000 THEN t - t % 300000
@@ -720,67 +810,50 @@ SELECT
   device,
   sum(n) AS n
 FROM (
-  SELECT hour_ts AS t, client, device, n
-  FROM hourly
-  WHERE :to - :from > 86400000
-    AND hour_ts >= :from AND hour_ts < :to
-    AND hour_ts < (SELECT coalesce(max(hour_ts) + 3600000, 0) FROM hourly)
-    AND (:client IS NULL OR client = :client)
-  UNION ALL
-  SELECT ts AS t, client, device, 1 AS n
-  FROM queries
-  WHERE ts >= max(:from, CASE WHEN :to - :from > 86400000
-          THEN (SELECT coalesce(max(hour_ts) + 3600000, 0) FROM hourly) ELSE 0 END)
-    AND ts < :to
-    AND (:client IS NULL OR client = :client)
-)
+",
+    hourly_parts!(
+        "hour_ts AS t, client, device, n",
+        "ts AS t, client, device, 1 AS n",
+        "    AND (:client IS NULL OR client = :client)\n"
+    ),
+    ")
 GROUP BY 1, client
-ORDER BY 1, device";
+ORDER BY 1, device"
+);
 
-// Over 24 hours: whole IST days that start inside the range, then raw rows.
-const TOP_DOMAINS: &str = "\
+const TOP_DOMAINS: &str = concat!(
+    daily_edges!(),
+    "\
 SELECT domain, sum(n) AS n
 FROM (
-  SELECT domain, n
-  FROM daily
-  WHERE :to - :from > 86400000
-    AND day_ts >= :from AND day_ts < :to
-    AND day_ts < (SELECT coalesce(max(day_ts) + 86400000, 0) FROM daily)
-    AND (:client IS NULL OR client = :client)
-  UNION ALL
-  SELECT domain, 1 AS n
-  FROM queries
-  WHERE ts >= max(:from, CASE WHEN :to - :from > 86400000
-          THEN (SELECT coalesce(max(day_ts) + 86400000, 0) FROM daily) ELSE 0 END)
-    AND ts < :to
-    AND (:client IS NULL OR client = :client)
-)
+",
+    daily_parts!(
+        "domain, n",
+        "domain, 1 AS n",
+        "    AND (:client IS NULL OR client = :client)\n"
+    ),
+    ")
 GROUP BY domain
 ORDER BY n DESC, domain
-LIMIT 20";
+LIMIT 20"
+);
 
-const TOP_BLOCKED: &str = "\
+const TOP_BLOCKED: &str = concat!(
+    daily_edges!(),
+    "\
 SELECT domain, sum(n) AS n
 FROM (
-  SELECT domain, n
-  FROM daily
-  WHERE :to - :from > 86400000
-    AND day_ts >= :from AND day_ts < :to
-    AND day_ts < (SELECT coalesce(max(day_ts) + 86400000, 0) FROM daily)
-    AND outcome = 'blocked'
-    AND (:client IS NULL OR client = :client)
-  UNION ALL
-  SELECT domain, 1 AS n
-  FROM queries
-  WHERE ts >= max(:from, CASE WHEN :to - :from > 86400000
-          THEN (SELECT coalesce(max(day_ts) + 86400000, 0) FROM daily) ELSE 0 END)
-    AND ts < :to
-    AND outcome = 'blocked'
-    AND (:client IS NULL OR client = :client)
-)
+",
+    daily_parts!(
+        "domain, n",
+        "domain, 1 AS n",
+        "    AND outcome = 'blocked'\n    AND (:client IS NULL OR client = :client)\n"
+    ),
+    ")
 GROUP BY domain
 ORDER BY n DESC, domain
-LIMIT 20";
+LIMIT 20"
+);
 
 // The chosen domain and its subdomains, newest first; with no domain, every lookup.
 // Raw rows only.
@@ -801,53 +874,44 @@ SELECT id, name, enabled, parsed AS rules, skipped_json AS skipped, fetched_ts, 
 FROM lists
 ORDER BY id";
 
-const TOP_RULES: &str = "\
+const TOP_RULES: &str = concat!(
+    daily_edges!(),
+    "\
 SELECT rule, list, sum(n) AS n
 FROM (
-  SELECT rule, list_id, list, n
-  FROM daily
-  WHERE :to - :from > 86400000
-    AND day_ts >= :from AND day_ts < :to
-    AND day_ts < (SELECT coalesce(max(day_ts) + 86400000, 0) FROM daily)
-    AND rule IS NOT NULL
-    AND (:client IS NULL OR client = :client)
-  UNION ALL
-  SELECT rule, list_id, list, 1 AS n
-  FROM queries
-  WHERE ts >= max(:from, CASE WHEN :to - :from > 86400000
-          THEN (SELECT coalesce(max(day_ts) + 86400000, 0) FROM daily) ELSE 0 END)
-    AND ts < :to
-    AND rule IS NOT NULL
-    AND (:client IS NULL OR client = :client)
-)
+",
+    daily_parts!(
+        "rule, list_id, list, n",
+        "rule, list_id, list, 1 AS n",
+        "    AND rule IS NOT NULL\n    AND (:client IS NULL OR client = :client)\n"
+    ),
+    ")
 GROUP BY list_id, rule
 ORDER BY n DESC, rule
-LIMIT 20";
+LIMIT 20"
+);
 
 // MATERIALIZED builds the set of hit rules once; inlined, it would be re-run per rule.
-const NEVER_HIT: &str = "\
-WITH hit AS MATERIALIZED (
-  SELECT list_id, rule
-  FROM daily
-  WHERE :to - :from > 86400000
-    AND day_ts >= :from AND day_ts < :to
-    AND day_ts < (SELECT coalesce(max(day_ts) + 86400000, 0) FROM daily)
-    AND rule IS NOT NULL
-    AND (:client IS NULL OR client = :client)
-  UNION
-  SELECT list_id, rule
-  FROM queries
-  WHERE ts >= max(:from, CASE WHEN :to - :from > 86400000
-          THEN (SELECT coalesce(max(day_ts) + 86400000, 0) FROM daily) ELSE 0 END)
-    AND ts < :to
-    AND rule IS NOT NULL
-    AND (:client IS NULL OR client = :client)
-)
+// DISTINCT keeps each hit rule once.
+const NEVER_HIT: &str = concat!(
+    daily_edges!(),
+    ",
+hit AS MATERIALIZED (
+SELECT DISTINCT list_id, rule
+FROM (
+",
+    daily_parts!(
+        "list_id, rule",
+        "list_id, rule",
+        "    AND rule IS NOT NULL\n    AND (:client IS NULL OR client = :client)\n"
+    ),
+    "))
 SELECT r.list, r.text AS rule
 FROM rules r
 WHERE NOT EXISTS (SELECT 1 FROM hit h WHERE h.list_id = r.list_id AND h.rule = r.text)
 ORDER BY r.list_id, r.id
-LIMIT 500";
+LIMIT 500"
+);
 
 const RECENT: &str = "\
 SELECT ts, time, device, domain, type, outcome, rule, served_from, latency_ms
