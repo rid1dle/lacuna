@@ -557,6 +557,33 @@ mod tests {
     }
 
     #[test]
+    fn scheme_separator_anchors_at_the_name_start() {
+        let (set, _) = build(
+            &[],
+            &[(1, "://jhf.ru^\n://*.a-akamaihd.com^\n://sportframe*.co^")],
+        );
+        assert!(is_block(&set.check("jhf.ru")));
+        assert_eq!(set.check("x.jhf.ru"), Verdict::Pass);
+        assert!(is_block(&set.check("x.a-akamaihd.com")));
+        assert!(is_block(&set.check("sportframe1.co")));
+        assert_eq!(set.check("sportframe1.com"), Verdict::Pass);
+    }
+
+    #[test]
+    fn many_star_rule_cannot_stall_a_lookup() {
+        // A list line with literals under 5 bytes is tried on every name.
+        let (set, _) = build(&[], &[(1, "a*a*a*a*a*a*a*a*a*a*b^")]);
+        let name = "a".repeat(60) + ".com";
+        // On a thread, so a regression fails the test instead of hanging the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(set.check(&name));
+        });
+        let verdict = rx.recv_timeout(std::time::Duration::from_millis(50));
+        assert_eq!(verdict, Ok(Verdict::Pass));
+    }
+
+    #[test]
     fn badfilter_cancels_a_wildcard_twin() {
         let (set, _) = build(
             &[],

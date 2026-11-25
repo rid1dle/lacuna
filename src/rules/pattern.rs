@@ -13,6 +13,8 @@
 //!   matches p at the start of the name or right after a dot, `|p` only at the start, and
 //!   `p` anywhere: `.d^` matches `x.d` but not `d`. A pattern with no `^` or trailing `|`
 //!   may end mid-name, so `||ads.` matches `ads.example.com`.
+//! - `rules/network.go` `hasURLPrefix`: `://` patterns are also matched against the URL,
+//!   where `://` sits right before the host, so `://p` is `|p` on the name.
 //! - `rules/network.go` `isPatternTooWide`: patterns shorter than 3 characters are rejected.
 
 use std::collections::HashMap;
@@ -64,13 +66,24 @@ impl Pattern {
             return None;
         }
         let lower = raw.to_ascii_lowercase();
-        let (anchor, body) = if let Some(body) = lower.strip_prefix("||") {
-            (Anchor::Label, body)
+        if let Some(body) = lower.strip_prefix("||") {
+            Self::build(Anchor::Label, body)
         } else if let Some(body) = lower.strip_prefix('|') {
-            (Anchor::Start, body)
+            Self::build(Anchor::Start, body)
         } else {
-            (Anchor::Anywhere, lower.as_str())
-        };
+            Self::build(Anchor::Anywhere, &lower)
+        }
+    }
+
+    /// The part after `://` of a `://host^` rule. AdGuard matches those against
+    /// "http://" + hostname (`hasURLPrefix` in rules/network.go), where `://` occurs once,
+    /// right before the host, so the rest is anchored at the start of the name.
+    pub fn parse_after_scheme(rest: &str) -> Option<Pattern> {
+        Self::build(Anchor::Start, &rest.to_ascii_lowercase())
+    }
+
+    /// `body` is lowercase, without its leading anchor.
+    fn build(anchor: Anchor, body: &str) -> Option<Pattern> {
         let (body, to_end) = match body.strip_suffix('|') {
             Some(body) => (body, true),
             None => (body, false),
@@ -122,60 +135,86 @@ impl Pattern {
     }
 
     /// `name` is lowercase with no trailing dot.
+    ///
+    /// Runs like a regex engine without backtracking. `live[i]` says some way of matching
+    /// the parts so far ends at byte `i`; each part turns that set into the next in one pass
+    /// over the name, so the cost is O(parts x name length) however many `*` there are. A
+    /// backtracking matcher is exponential in the number of `*`, and a list line plus a
+    /// name any web page can make a browser look up would stall the DNS worker.
     pub fn matches(&self, name: &str) -> bool {
-        let name = name.as_bytes();
+        // Two position sets on the stack for any real DNS name (at most 253 bytes).
+        const STACK: usize = 256;
+        let len = name.len() + 1;
+        if len <= STACK {
+            let (mut live, mut next) = ([false; STACK], [false; STACK]);
+            self.run(name.as_bytes(), &mut live[..len], &mut next[..len])
+        } else {
+            self.run(
+                name.as_bytes(),
+                &mut vec![false; len],
+                &mut vec![false; len],
+            )
+        }
+    }
+
+    /// `live` and `next` are all false, one longer than `name`.
+    fn run<'a>(&self, name: &[u8], mut live: &'a mut [bool], mut next: &'a mut [bool]) -> bool {
+        let end = name.len();
         match self.anchor {
-            Anchor::Start => self.match_parts(&self.parts, name, 0),
-            // An unanchored pattern behaves as if it began with `*`.
-            Anchor::Anywhere => self.match_after_any(&self.parts, name, 0),
+            Anchor::Start => live[0] = true,
+            // An unanchored pattern may start anywhere, as if it began with `*`.
+            Anchor::Anywhere => live.fill(true),
             Anchor::Label => {
-                if self.match_parts(&self.parts, name, 0) {
-                    return true;
-                }
+                live[0] = true;
                 // The optional `([a-z0-9-_.]+\.)` prefix: at least one host character, then
                 // a dot. It cannot cross a character outside that set.
                 for (i, &b) in name.iter().enumerate() {
                     if !is_host_byte(b) {
                         break;
                     }
-                    if b == b'.' && i > 0 && self.match_parts(&self.parts, name, i + 1) {
-                        return true;
+                    if b == b'.' && i > 0 {
+                        live[i + 1] = true;
                     }
                 }
-                false
             }
         }
-    }
 
-    fn match_parts(&self, parts: &[Part], name: &[u8], at: usize) -> bool {
-        let Some((first, rest)) = parts.split_first() else {
-            return !self.to_end || at == name.len();
-        };
-        match first {
-            Part::Text(t) => {
-                name.get(at..)
-                    .is_some_and(|tail| tail.starts_with(t.as_bytes()))
-                    && self.match_parts(rest, name, at + t.len())
+        for part in self.parts.iter() {
+            next.fill(false);
+            match part {
+                Part::Text(t) => {
+                    let t = t.as_bytes();
+                    for (i, _) in live.iter().enumerate().filter(|(_, &l)| l) {
+                        if name[i..].starts_with(t) {
+                            next[i + t.len()] = true;
+                        }
+                    }
+                }
+                Part::Separator => {
+                    for (i, &b) in name.iter().enumerate() {
+                        if live[i] && is_separator(b) {
+                            next[i + 1] = true;
+                        }
+                    }
+                    // `$`: zero width, only at the end.
+                    next[end] |= live[end];
+                }
+                // `*` reaches every position from the first live one on.
+                Part::Any => {
+                    if let Some(first) = live.iter().position(|&l| l) {
+                        next[first..].fill(true);
+                    }
+                }
             }
-            Part::Separator => match name.get(at) {
-                None => self.match_parts(rest, name, at),
-                Some(&b) => is_separator(b) && self.match_parts(rest, name, at + 1),
-            },
-            Part::Any => self.match_after_any(rest, name, at),
+            std::mem::swap(&mut live, &mut next);
+            if !live.contains(&true) {
+                return false;
+            }
         }
-    }
-
-    /// `*` then `parts`: try every place `parts` could begin at or after `from`.
-    fn match_after_any(&self, parts: &[Part], name: &[u8], from: usize) -> bool {
-        match parts.first() {
-            // Only where the next text occurs, rather than at every position.
-            Some(Part::Text(t)) => {
-                let t = t.as_bytes();
-                (from..name.len())
-                    .filter(|&i| name[i..].starts_with(t))
-                    .any(|i| self.match_parts(parts, name, i))
-            }
-            _ => (from..=name.len()).any(|i| self.match_parts(parts, name, i)),
+        if self.to_end {
+            live[end]
+        } else {
+            true
         }
     }
 }
@@ -336,6 +375,37 @@ mod tests {
         assert!(!pat.matches("skadsdkless.appsflyersdk.com"));
         // Overlapping candidates: the second "aa" is the one that fits.
         assert!(p("aab^").matches("aaab"));
+    }
+
+    /// Runs `f` on a thread and fails if it takes longer than `limit`, so a regression
+    /// fails the test instead of hanging the suite.
+    fn finishes_within(
+        limit: std::time::Duration,
+        f: impl FnOnce() -> bool + Send + 'static,
+    ) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit)
+            .unwrap_or_else(|_| panic!("did not finish within {limit:?}"))
+    }
+
+    #[test]
+    fn matching_is_linear_in_stars_and_name_length() {
+        let limit = std::time::Duration::from_millis(5);
+        // 20 stars against a 253-character run of the first literal: exponential
+        // backtracking would never finish.
+        let raw = format!("{}b^", "a*".repeat(20));
+        let pat = p(&raw);
+        let name = "a".repeat(253);
+        assert!(!finishes_within(limit, move || pat.matches(&name)));
+        let pat = p(&raw);
+        let name = "a".repeat(252) + "b";
+        assert!(finishes_within(limit, move || pat.matches(&name)));
+        let pat = p("||a*.a*.a*.a*.a*.a*.a*.a*.a*.a*.x^");
+        let name = "a.".repeat(126) + "a";
+        assert!(!finishes_within(limit, move || pat.matches(&name)));
     }
 
     #[test]

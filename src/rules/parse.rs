@@ -129,7 +129,8 @@ pub fn parse_line(line: &str) -> Parsed {
     if pattern.len() > 1 && pattern.starts_with('/') && pattern.ends_with('/') {
         return Parsed::Skip(SkipReason::Regex);
     }
-    if pattern.contains('/') {
+    let after_scheme = pattern.strip_prefix("://");
+    if after_scheme.unwrap_or(pattern).contains('/') {
         return Parsed::Skip(SkipReason::UrlPath);
     }
 
@@ -147,12 +148,22 @@ pub fn parse_line(line: &str) -> Parsed {
         }
     }
 
-    let target = if !allow && modifiers.is_none() && is_host_rule_name(pattern) {
+    let target = if let Some(rest) = after_scheme {
+        match Pattern::parse_after_scheme(rest) {
+            Some(p) => Target::Pattern(p),
+            None => return Parsed::Skip(SkipReason::Invalid),
+        }
+    } else if !allow && modifiers.is_none() && is_host_rule_name(pattern) {
         // AdGuard reads a line that is only a host name as a hosts line for 0.0.0.0, which
         // blocks that exact name (urlfilter `rules/rule.go` `NewRule` tries `NewHostRule`
         // first; `dnsengine.go` looks host rules up by the exact hostname).
         Target::Exact(pattern.to_ascii_lowercase())
     } else if let Some(domain) = suffix_shape(pattern) {
+        // AdGuard matches the dot literally and a hostname never ends in one, so
+        // `||example.com.^` can never match: count it rather than widen it.
+        if domain.ends_with('.') {
+            return Parsed::Skip(SkipReason::Invalid);
+        }
         match normalize_domain(domain) {
             Some(domain) => Target::Suffix(domain),
             None => return Parsed::Skip(SkipReason::Invalid),
@@ -407,15 +418,26 @@ mod tests {
     #[test]
     fn url_path_skipped() {
         assert_eq!(skip("||example.com/ads/"), SkipReason::UrlPath);
-        assert_eq!(skip("://ads.example.com^"), SkipReason::UrlPath);
+        assert_eq!(skip("://ads.example.com/x^"), SkipReason::UrlPath);
+        assert_eq!(skip("http://ads.example.com^"), SkipReason::UrlPath);
     }
 
     #[test]
-    fn normalizes_case_and_trailing_dot() {
+    fn scheme_separator_rules_are_patterns() {
+        for line in ["://jhf.ru^", "://*.a-akamaihd.com^", "://sportframe*.co^"] {
+            assert!(matches!(rule(line).target, Target::Pattern(_)), "{line}");
+        }
+    }
+
+    #[test]
+    fn normalizes_case_and_skips_trailing_dot() {
         assert_eq!(
-            rule("||EXAMPLE.Com.^").target,
+            rule("||EXAMPLE.Com^").target,
             Target::Suffix("example.com".into())
         );
+        // AdGuard matches `example.com.` literally, and a hostname never ends in a dot.
+        assert_eq!(skip("||example.com.^"), SkipReason::Invalid);
+        assert_eq!(skip("@@||example.com.^|"), SkipReason::Invalid);
     }
 
     #[test]
