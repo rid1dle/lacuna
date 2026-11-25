@@ -142,10 +142,10 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         match version {
             Some(SCHEMA_VERSION) => {}
             Some(v) if v > SCHEMA_VERSION => bail!(
-                "schema_version {v} is newer than this sieve understands ({SCHEMA_VERSION}); \
+                "schema_version {v} is newer than this lacuna understands ({SCHEMA_VERSION}); \
                  refusing to start rather than write to it"
             ),
-            other => bail!("not a sieve database: meta.schema_version is {other:?}"),
+            other => bail!("not a lacuna database: meta.schema_version is {other:?}"),
         }
     }
 
@@ -251,7 +251,7 @@ pub(crate) mod testing {
         pub fn new(tag: &str) -> TempDb {
             static NEXT: AtomicU32 = AtomicU32::new(0);
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
-            let name = format!("sieve-test-{tag}-{}-{n}.db", std::process::id());
+            let name = format!("lacuna-test-{tag}-{}-{n}.db", std::process::id());
             let db = TempDb(std::env::temp_dir().join(name));
             db.remove();
             db
@@ -379,7 +379,7 @@ mod tests {
                 "https://dns10.quad9.net/dns-query".into(),
                 1.5,
                 "0.0.0.0,::".into(),
-                "sieve".into()
+                "lacuna".into()
             )
         );
     }
@@ -535,7 +535,7 @@ mod tests {
             })
             .collect();
         let tx = store.conn.transaction().unwrap();
-        writer::insert_batch(&tx, &records, Source::Sieve).unwrap();
+        writer::insert_batch(&tx, &records, Source::Lacuna).unwrap();
         tx.commit().unwrap();
         let mut stmt = store
             .conn

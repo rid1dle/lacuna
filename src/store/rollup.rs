@@ -191,7 +191,7 @@ mod tests {
     fn store_with(records: &[QueryRecord]) -> Store {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         let tx = store.conn.transaction().unwrap();
-        writer::insert_batch(&tx, records, Source::Sieve).unwrap();
+        writer::insert_batch(&tx, records, Source::Lacuna).unwrap();
         tx.commit().unwrap();
         store
     }

@@ -5,7 +5,7 @@
 //! PTR record of clients that have no name yet, or whose PTR name is over a day old.
 //!
 //! Probe (2026-11-25, from a rust:1-alpine container on the host network, via
-//! `sieve ask <ip>.0.168.192.in-addr.arpa PTR --server 192.168.0.1:53`): the router
+//! `lacuna ask <ip>.0.168.192.in-addr.arpa PTR --server 192.168.0.1:53`): the router
 //! answers PTR for LAN clients.
 //!   100.0.168.192.in-addr.arpa. 0 IN PTR MacBookPro.lan.
 //!   196.0.168.192.in-addr.arpa. 0 IN PTR MacBookAir.lan.

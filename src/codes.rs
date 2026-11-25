@@ -72,7 +72,7 @@ coded_enum! {
 coded_enum! {
     /// Which system wrote the row.
     Source {
-        Sieve = 0 => "sieve",
+        Lacuna = 0 => "lacuna",
         Adguard = 1 => "adguard",
     }
 }

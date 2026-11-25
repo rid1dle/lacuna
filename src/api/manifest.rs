@@ -1,4 +1,4 @@
-//! The manifest: what Sonder needs to show sieve's data without knowing sieve. The public
+//! The manifest: what Sonder needs to show lacuna's data without knowing lacuna. The public
 //! views with their columns, the variables, the default dashboards (SQL panels written
 //! against the views only) and the actions.
 //!
@@ -27,7 +27,7 @@ pub struct Manifest {
     pub name: &'static str,
     pub version: &'static str,
     pub schema_version: u32,
-    /// Queries sieve runs at once (`api.max_concurrent`); more wait, then get 429.
+    /// Queries lacuna runs at once (`api.max_concurrent`); more wait, then get 429.
     pub max_concurrent: usize,
     pub schema: Vec<View>,
     pub variables: Vec<Variable>,
@@ -171,7 +171,7 @@ impl ActionId {
 
 pub fn manifest(max_concurrent: usize) -> Manifest {
     Manifest {
-        name: "sieve",
+        name: "lacuna",
         version: env!("CARGO_PKG_VERSION"),
         schema_version: SCHEMA_VERSION,
         max_concurrent,
@@ -299,7 +299,7 @@ fn schema() -> Vec<View> {
                 ),
                 col("latency_ms", "real", "Time to answer, milliseconds"),
                 col("answers", "text", "A/AAAA addresses sent, comma separated"),
-                col("source", "text", "sieve, or adguard for imported history"),
+                col("source", "text", "lacuna, or adguard for imported history"),
             ],
         },
         View {

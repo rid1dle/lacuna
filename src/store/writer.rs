@@ -184,7 +184,7 @@ impl Writer {
 
 fn write_batch(conn: &mut Connection, records: &[QueryRecord], dropped: u64) -> Result<()> {
     let tx = conn.transaction()?;
-    let late = insert_batch(&tx, records, Source::Sieve)?;
+    let late = insert_batch(&tx, records, Source::Lacuna)?;
     add_counter(&tx, LOG_DROPPED, dropped)?;
     add_counter(&tx, LOG_LATE, late)?;
     add_counter(&tx, QUERIES_TOTAL, records.len() as u64 + dropped)?;

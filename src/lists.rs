@@ -49,7 +49,7 @@ pub trait Fetch: Send + Sync {
 }
 
 /// Fetches over HTTP(S). The list host has no fixed address and the machine's resolver
-/// is sieve itself, so the host is resolved through sieve's own upstreams and pinned
+/// is lacuna itself, so the host is resolved through lacuna's own upstreams and pinned
 /// into the client.
 pub struct HttpFetcher<U: Upstream> {
     ups: Arc<Upstreams<U>>,
@@ -131,7 +131,7 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     text
 }
 
-/// An A lookup through sieve's own upstreams (DoH race, then fallback).
+/// An A lookup through lacuna's own upstreams (DoH race, then fallback).
 async fn resolve_host<U: Upstream + 'static>(
     ups: &Upstreams<U>,
     host: &str,
@@ -729,7 +729,7 @@ mod tests {
         let db = TempDb::new(tag);
         Store::open(&db.0).unwrap();
         let dir = std::env::temp_dir().join(format!(
-            "sieve-lists-{tag}-{}-{}",
+            "lacuna-lists-{tag}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -888,7 +888,7 @@ mod tests {
     async fn one_failed_list_does_not_block_the_others() {
         let db = TempDb::new("two");
         Store::open(&db.0).unwrap();
-        let dir = std::env::temp_dir().join(format!("sieve-lists-two-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lacuna-lists-two-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let fetch = FakeFetch::default();
         fetch.set(URL1, Ok("||one.test^\n"));
@@ -914,7 +914,7 @@ mod tests {
     async fn an_empty_body_for_one_list_keeps_its_old_body_while_another_updates() {
         let db = TempDb::new("mixed");
         Store::open(&db.0).unwrap();
-        let dir = std::env::temp_dir().join(format!("sieve-lists-mixed-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lacuna-lists-mixed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let fetch = FakeFetch::default();
         let rules = shared(RuleSet::default());
@@ -1231,7 +1231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_names_resolve_through_sieves_upstreams() {
+    async fn host_names_resolve_through_lacunas_upstreams() {
         let state = Arc::new(State::default());
         let ups = upstreams(&state, Duration::from_millis(1));
         let ip = resolve_host(&ups, "lists.example").await.unwrap();

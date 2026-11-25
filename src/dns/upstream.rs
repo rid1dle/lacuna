@@ -86,7 +86,7 @@ pub struct DohUpstream {
 
 impl DohUpstream {
     /// `bootstrap` pins the host to fixed IPs, so reqwest never asks the system resolver
-    /// (which on this host is sieve itself and would loop). Config validation guarantees
+    /// (which on this host is lacuna itself and would loop). Config validation guarantees
     /// it is non-empty unless the URL host is an IP literal.
     pub fn new(url: &str, bootstrap: &[IpAddr]) -> Result<Self> {
         let parsed = reqwest::Url::parse(url).with_context(|| format!("bad doh url {url}"))?;

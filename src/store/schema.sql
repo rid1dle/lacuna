@@ -1,4 +1,4 @@
--- sieve's query log tables, schema version 1. Created once, for a new database.
+-- lacuna's query log tables, schema version 1. Created once, for a new database.
 --
 -- Tables are internal: they may change between releases. The public contract is the
 -- views in views.sql. Times are unix milliseconds, UTC. Enum columns hold the integer

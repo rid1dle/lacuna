@@ -1,4 +1,4 @@
--- sieve's public views, schemaVersion 1: the contract Sonder's dashboards query with
+-- lacuna's public views, schemaVersion 1: the contract Sonder's dashboards query with
 -- their own SQL. A change that breaks old SQL bumps schema_version.
 --
 -- Every open drops and recreates these from the running build, so the labels always

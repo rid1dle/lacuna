@@ -474,7 +474,7 @@ async fn reload_config<F: Fetch + 'static, U: Upstream>(rt: &Runtime<F, U>) -> (
     (true, message)
 }
 
-/// What sieve would answer for a name, in the pipeline's order: refused names,
+/// What lacuna would answer for a name, in the pipeline's order: refused names,
 /// rewrites, then the rules. `ok` is false only for a name that is not one.
 fn test_domain<F: Fetch, U: Upstream + 'static>(
     rt: &Runtime<F, U>,
@@ -494,7 +494,7 @@ fn test_domain<F: Fetch, U: Upstream + 'static>(
         .iter()
         .any(|r| r.trim_end_matches('.').eq_ignore_ascii_case(&name));
     if refused {
-        return (true, "refused: sieve never answers this name".to_string());
+        return (true, "refused: lacuna never answers this name".to_string());
     }
     if let Some(a) = rewrite_for(&live.rewrites, &name) {
         return (true, format!("rewritten to {a}"));
@@ -619,7 +619,7 @@ mod tests {
         let db = TempDb::new(tag);
         drop(Store::open(&db.0).unwrap());
         let dir = std::env::temp_dir().join(format!(
-            "sieve-api-{tag}-{}-{}",
+            "lacuna-api-{tag}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn read_secret_trims_and_treats_empty_as_missing() {
-        let dir = std::env::temp_dir().join(format!("sieve-secret-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lacuna-secret-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("secret");
         std::fs::write(&file, "  abc123\n").unwrap();
@@ -802,7 +802,7 @@ mod tests {
             .call(Method::GET, "/integration/manifest", Some(AUTH), None)
             .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(m["name"], "sieve");
+        assert_eq!(m["name"], "lacuna");
         assert_eq!(m["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(m["schemaVersion"], 1);
         assert_eq!(m["maxConcurrent"], 2);
@@ -952,7 +952,7 @@ mod tests {
         let store = Store::open(db).unwrap();
         let mut conn = rusqlite::Connection::open(db).unwrap();
         let tx = conn.transaction().unwrap();
-        writer::insert_batch(&tx, &records, Source::Sieve).unwrap();
+        writer::insert_batch(&tx, &records, Source::Lacuna).unwrap();
         tx.execute_batch(&format!(
             "UPDATE client_names SET name = 'laptop', origin = 'config' WHERE ip = '{LAPTOP}';
              INSERT INTO list_meta (id, name, url, enabled, parsed, skipped_json, fetched_at)
@@ -1580,7 +1580,7 @@ mod tests {
         let slow = tokio::spawn(async move {
             let mut s = tokio::net::TcpStream::connect(api_addr).await.unwrap();
             let req = format!(
-                "POST /integration/query HTTP/1.1\r\nHost: sieve\r\nAuthorization: {AUTH}\r\n\
+                "POST /integration/query HTTP/1.1\r\nHost: lacuna\r\nAuthorization: {AUTH}\r\n\
                  Content-Type: application/json\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{body}",
                 body.len()

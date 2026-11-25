@@ -45,13 +45,13 @@ a = "192.168.0.107"
 
 [api]
 listen = "0.0.0.0:8053"
-secret_file = "/run/secrets/sieve_api"
+secret_file = "/run/secrets/lacuna_api"
 query_timeout_ms = 5000
 row_cap = 10000
 max_concurrent = 2
 
 [store]
-path = "/data/sieve.db"
+path = "/data/lacuna.db"
 raw_days = 30
 rollup_days = 365
 lists_dir = "/data/lists"

@@ -28,7 +28,7 @@ use dns::upstream::{Remote, UdpUpstream, Upstream, Upstreams};
 use lists::{HttpFetcher, Lists};
 use store::{writer, Retention, Store};
 
-const USAGE: &str = "usage: sieve <check-config <path> | serve <path> | \
+const USAGE: &str = "usage: lacuna <check-config <path> | serve <path> | \
                      ask <name> [type] [--server addr] [--expect ip]>";
 
 /// `ask` waits this long for an answer, UDP plus a TCP retry.
@@ -342,7 +342,7 @@ mod tests {
         let (_, writer) = start_log(Err(anyhow::anyhow!("disk gone")));
         assert!(writer.is_none());
 
-        // A database from a newer sieve is refused by the store; serve carries on.
+        // A database from a newer lacuna is refused by the store; serve carries on.
         let db = TempDb::new("newer");
         Store::open(&db.0).unwrap();
         rusqlite::Connection::open(&db.0)

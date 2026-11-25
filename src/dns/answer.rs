@@ -1,4 +1,4 @@
-//! Builders for the DNS responses sieve produces itself (blocks, rewrites, errors).
+//! Builders for the DNS responses lacuna produces itself (blocks, rewrites, errors).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

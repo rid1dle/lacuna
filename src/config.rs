@@ -127,7 +127,7 @@ impl Config {
                 d.url
             );
             // Without a pinned address reqwest would resolve the host through the system
-            // resolver, which is sieve itself.
+            // resolver, which is lacuna itself.
             let host = reqwest::Url::parse(&d.url)
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_owned))

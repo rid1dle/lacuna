@@ -1,10 +1,10 @@
-# sieve integration contract
+# lacuna integration contract
 
-This is the HTTP API that sieve serves for Sonder (or any other consumer). It is the
-only thing the two share. Sonder reads sieve's data through it, shows sieve's default
+This is the HTTP API that lacuna serves for Sonder (or any other consumer). It is the
+only thing the two share. Sonder reads lacuna's data through it, shows lacuna's default
 dashboards, runs user-written SQL, and triggers runtime actions.
 
-- Base URL: `http://sieve:8053` on the internal `sieve-api` network.
+- Base URL: `http://lacuna:8053` on the internal `lacuna-api` network.
 - Contract version: `schemaVersion` 1 (see [Versioning](#versioning)).
 - All bodies are JSON (`Content-Type: application/json`), field names in camelCase.
 
@@ -12,7 +12,7 @@ dashboards, runs user-written SQL, and triggers runtime actions.
 
 | Call | Purpose |
 |---|---|
-| `GET /integration/manifest` | What sieve offers: views, variables, dashboards, actions |
+| `GET /integration/manifest` | What lacuna offers: views, variables, dashboards, actions |
 | `POST /integration/query` | Run one read-only SQL query, get a frame of rows |
 | `POST /integration/actions/{id}` | Run a runtime action (pause, resume, ...) |
 
@@ -24,18 +24,18 @@ Every request, including unknown paths, carries:
 Authorization: Bearer <secret>
 ```
 
-The secret is a file mounted into sieve (default `/run/secrets/sieve_api`, set by
+The secret is a file mounted into lacuna (default `/run/secrets/lacuna_api`, set by
 `api.secret_file`), read once at startup. Surrounding whitespace, such as a trailing
 newline, is ignored. The comparison runs in constant time.
 
 | Situation | Status | Body |
 |---|---|---|
-| sieve has no secret (file missing or empty) | 503 | `{"error":"api secret not configured"}` |
+| lacuna has no secret (file missing or empty) | 503 | `{"error":"api secret not configured"}` |
 | No `Authorization` header | 401 | `{"error":"missing bearer token"}` |
 | Wrong token, or not the `Bearer` scheme | 401 | `{"error":"wrong bearer token"}` |
 
-With no secret configured sieve refuses every request (fail closed); DNS keeps working.
-A new secret takes effect at the next restart of sieve.
+With no secret configured lacuna refuses every request (fail closed); DNS keeps working.
+A new secret takes effect at the next restart of lacuna.
 
 ## Errors
 
@@ -48,7 +48,7 @@ person. Status codes:
 | 401 | Missing or wrong bearer token |
 | 404 | Unknown path or unknown action id |
 | 429 | `{"error":"busy"}`: no query slot came free within 2 seconds |
-| 500 | A bug in sieve |
+| 500 | A bug in lacuna |
 | 503 | No secret configured; or, on `/integration/query` only, the query log could not open |
 
 An action that runs but does not succeed (bad parameter, failed fetch) is not an HTTP
@@ -56,15 +56,15 @@ error: it answers 200 with `"ok": false`.
 
 ## GET /integration/manifest
 
-Describes everything else. It never changes while sieve runs; fetch it on page load,
-or cache it until sieve restarts. It also serves as the "is sieve up" check: there is no
+Describes everything else. It never changes while lacuna runs; fetch it on page load,
+or cache it until lacuna restarts. It also serves as the "is lacuna up" check: there is no
 separate status call.
 
 Request:
 
 ```
 GET /integration/manifest HTTP/1.1
-Host: sieve:8053
+Host: lacuna:8053
 Authorization: Bearer 7f3c9a...
 ```
 
@@ -74,7 +74,7 @@ shape is shown in full once.
 
 ```json
 {
-  "name": "sieve",
+  "name": "lacuna",
   "version": "0.1.0",
   "schemaVersion": 1,
   "maxConcurrent": 2,
@@ -127,14 +127,14 @@ shape is shown in full once.
 }
 ```
 
-`maxConcurrent` is how many queries sieve runs at once; see [Limits](#limits). It was
+`maxConcurrent` is how many queries lacuna runs at once; see [Limits](#limits). It was
 added within `schemaVersion` 1, so treat it as optional and assume 1 when absent.
 
 ### schema
 
 The public views, which are the only surface SQL should be written against. Each view
 has a `description` and its `columns` in order, each with a `type` of `integer`, `real`
-or `text`. sieve's internal tables (`raw_queries`, `hourly_counts`, ...) are readable
+or `text`. lacuna's internal tables (`raw_queries`, `hourly_counts`, ...) are readable
 too, but they may change in any release without notice; the views do not change within
 a `schemaVersion`.
 
@@ -158,10 +158,10 @@ Conventions in the views:
   that starts the day, `daily.day` its `YYYY-MM-DD` label.
 - `device` and `list` are looked up when the query runs: renaming a device or a list
   relabels its history.
-- `list_id` 0 is the user rules from sieve's config, named `user rules`.
+- `list_id` 0 is the user rules from lacuna's config, named `user rules`.
 - `answers` is the A/AAAA addresses sent, comma separated, `''` when there were none.
 
-**Never create views in sieve's database.** At every start sieve drops every view in
+**Never create views in lacuna's database.** At every start lacuna drops every view in
 the database file, its own and any other, and recreates its own. A view added by
 anyone else is silently lost at the next restart. (The query API cannot create one
 anyway; this is for anyone opening the file directly.)
@@ -173,7 +173,7 @@ Variables are values the user picks on a dashboard and SQL reads as `:id`.
 - `client` (label "Device"): its `optionsSql` lists the choices; run it through
   `/integration/query` like any panel and offer its rows, `value` to bind and `label`
   to show.
-- `domain` (label "Domain"): free text, no `optionsSql`. sieve lowercases it where it is
+- `domain` (label "Domain"): free text, no `optionsSql`. lacuna lowercases it where it is
   used; the user may type `Example.com`.
 
 A dashboard's `variables` lists the ids it shows pickers for.
@@ -198,7 +198,7 @@ Option roles, each naming a result column (absent roles are not set):
 | `timeseries` | `x`, `y`, `series` (optional) | `x` is unix ms; one line per distinct `series` value |
 | `bar` | `label`, `y`, `series` (optional) | One bar per `label`; `series` splits each bar |
 | `table` | none | Every column, in order |
-| `log` | none | Every column, newest rows first, as sieve returns them |
+| `log` | none | Every column, newest rows first, as lacuna returns them |
 
 Any kind may also carry `refreshSeconds`: redraw that often while the page is open.
 In version 1 only `live.recent` sets it (5).
@@ -221,7 +221,7 @@ Each action has an `id` (used in the URL), a `label`, and `params`, each with an
 
 ## POST /integration/query
 
-Runs one read-only SQL statement against sieve's log and returns the rows.
+Runs one read-only SQL statement against lacuna's log and returns the rows.
 
 Request body:
 
@@ -251,7 +251,7 @@ Request:
 
 ```
 POST /integration/query HTTP/1.1
-Host: sieve:8053
+Host: lacuna:8053
 Authorization: Bearer 7f3c9a...
 Content-Type: application/json
 
@@ -286,11 +286,11 @@ The frame:
 | `columns` | Result columns in order. `type` is that of the column's first non-null value: `integer`, `real`, `text`, or `null` when every value is null or there are no rows |
 | `rows` | Arrays in column order. Blobs appear as the text `"<blob N bytes>"`; an infinite or NaN real as `null` |
 | `truncated` | `true` when the query had more rows than the row cap; `rows` then holds exactly the cap |
-| `elapsedMs` | Time the query took in sieve, milliseconds |
+| `elapsedMs` | Time the query took in lacuna, milliseconds |
 
 The body is streamed as it is written (chunked). Read it to the end before parsing. If
 it does not parse, treat the call as failed: a body cut short is the only sign of a
-fault in sieve once a 200 has been sent.
+fault in lacuna once a 200 has been sent.
 
 Errors, all `400` unless noted:
 
@@ -341,7 +341,7 @@ On 429 `busy`, retry that query after a backoff (for example 0.5 s, then 1 s, th
 
 ## POST /integration/actions/{id}
 
-Runs a runtime action. Durable settings live in sieve's `config.toml`; actions only act
+Runs a runtime action. Durable settings live in lacuna's `config.toml`; actions only act
 on the running process (a pause does not survive a restart).
 
 Request body: `{ "params": { ... } }`. An empty body is the same as no params.
@@ -372,7 +372,7 @@ rules. It does not resolve the name, so a block that DNS would make on a CNAME t
 does not show. Messages:
 `allowed`, `allowed by <rule> (<list>)`, `blocked by <rule> (<list>)`,
 `answered <ip> by <rule> (<list>)`, `rewritten to <ip>`,
-`refused: sieve never answers this name`. During a pause a blocking verdict reads
+`refused: lacuna never answers this name`. During a pause a blocking verdict reads
 `allowed: blocking is paused (otherwise blocked by ...)`.
 
 Set the consumer's HTTP timeout for actions to at least 2 minutes (`refresh_lists`
@@ -384,7 +384,7 @@ Pause:
 
 ```
 POST /integration/actions/pause HTTP/1.1
-Host: sieve:8053
+Host: lacuna:8053
 Authorization: Bearer 7f3c9a...
 Content-Type: application/json
 
@@ -405,7 +405,7 @@ Resume (no body needed):
 
 ```
 POST /integration/actions/resume HTTP/1.1
-Host: sieve:8053
+Host: lacuna:8053
 Authorization: Bearer 7f3c9a...
 ```
 
@@ -417,7 +417,7 @@ Refresh lists:
 
 ```
 POST /integration/actions/refresh_lists HTTP/1.1
-Host: sieve:8053
+Host: lacuna:8053
 Authorization: Bearer 7f3c9a...
 ```
 
@@ -431,7 +431,7 @@ Reload config:
 
 ```
 POST /integration/actions/reload_config HTTP/1.1
-Host: sieve:8053
+Host: lacuna:8053
 Authorization: Bearer 7f3c9a...
 ```
 
@@ -449,7 +449,7 @@ Test a domain:
 
 ```
 POST /integration/actions/test_domain HTTP/1.1
-Host: sieve:8053
+Host: lacuna:8053
 Authorization: Bearer 7f3c9a...
 Content-Type: application/json
 
@@ -471,4 +471,4 @@ The consumer stores, with every panel it saves, the `schemaVersion` it was writt
 against, and shows which saved panels are older than the current one. Default
 dashboards are read live from the manifest, so they always match.
 
-`version` is sieve's build version, for display only.
+`version` is lacuna's build version, for display only.
