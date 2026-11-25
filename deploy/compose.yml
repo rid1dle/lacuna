@@ -5,8 +5,13 @@
 # CUTOVER: change the two port lines below from 5300 to 53 (README, "Cutover").
 #
 # First time:
-#   1. scripts/provision/networks.sh   (creates the lacuna-api network)
+#   1. ~/homelab/scripts/provision/networks.sh   (creates the lacuna-api network)
 # Then: docker compose up -d --build
+
+# The project name must be set. Compose otherwise names the project after the
+# folder, and Sonder's compose file also lives in a folder called deploy/, so
+# both became project "deploy": `docker compose stop` here would stop Sonder too.
+name: lacuna
 
 services:
   lacuna:
