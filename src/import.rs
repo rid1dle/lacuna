@@ -22,6 +22,7 @@ use serde::Deserialize;
 
 use crate::codes::{Outcome, Reason, ServedFrom};
 use crate::dns::pipeline::{addresses, QueryRecord};
+use crate::rules::RuleRef;
 use crate::store::{rollup, writer, Store, DAY_MS, HOUR_MS};
 
 /// Rows per transaction.
@@ -308,10 +309,11 @@ fn parse_line(bytes: &[u8]) -> Result<(QueryRecord, bool), Skip> {
     Ok((record, decoded_ok))
 }
 
-fn first_rule(result: &AgResult) -> Result<(u32, Arc<str>), Skip> {
+/// AdGuard's history names rules by text; the writer interns them.
+fn first_rule(result: &AgResult) -> Result<(u32, RuleRef), Skip> {
     let rule = result.rules.first().ok_or(Skip::NoRule)?;
     let list = u32::try_from(rule.list_id).map_err(|_| Skip::ListIdOutOfRange)?;
-    Ok((list, Arc::from(rule.text.as_str())))
+    Ok((list, RuleRef::Text(Arc::from(rule.text.as_str()))))
 }
 
 /// The rcode and A/AAAA addresses of a base64 DNS response; `None` if it is not one.

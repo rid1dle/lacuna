@@ -325,14 +325,19 @@ async fn serve_dns(
     let (user_only, _) = rules::RuleSet::build(&config.user_rules, &[]);
     let rules = pipeline::shared(user_only);
     let upstreams = Arc::new(Upstreams::from_config(&config.upstreams)?);
-    let lists = Arc::new(Lists::new(
+    let mut lists = Lists::new(
         config.lists.clone(),
         config.user_rules.clone(),
         config.store.lists_dir.clone(),
         config.store.path.clone(),
         Arc::clone(&rules),
         HttpFetcher::new(Arc::clone(&upstreams)),
-    ));
+    );
+    if store.is_err() {
+        warn!("query log unavailable, rule texts stay in memory");
+        lists.keep_texts_in_memory();
+    }
+    let lists = Arc::new(lists);
     lists.sync_meta().await;
     if let Err(e) = lists.load_last_good().await {
         error!("loading last good lists, serving user rules only: {e:#}");

@@ -24,13 +24,13 @@ use anyhow::{Context, Result};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, RecordType};
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Statement, TransactionBehavior};
 use tracing::{info, warn};
 
 use crate::config::ListConfig;
 use crate::dns::pipeline::Shared;
 use crate::dns::upstream::{client_builder, Upstream, Upstreams};
-use crate::rules::{parse_line, ListStats, Parsed, RuleSet};
+use crate::rules::{parse_line, ListStats, Parsed, RuleIds, RuleSet};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// A list bigger than this is refused: the largest real list is a few MB.
@@ -222,6 +222,9 @@ pub struct Lists<F: Fetch> {
     /// Stats of the build behind the live set; None until one succeeds, which makes the
     /// next refresh rebuild.
     built: Mutex<Option<Vec<ListStats>>>,
+    /// Builds take rule ids from `rule_texts`. False when the query log is unavailable:
+    /// the set then keeps its texts, and nothing writes to a database the log refused.
+    texts_in_db: bool,
 }
 
 impl<F: Fetch> Lists<F> {
@@ -241,7 +244,14 @@ impl<F: Fetch> Lists<F> {
             fetcher,
             refresh_lock: tokio::sync::Mutex::new(()),
             built: Mutex::new(None),
+            texts_in_db: true,
         }
+    }
+
+    /// Builds keep rule texts in memory instead of in `rule_texts`: for a query log that
+    /// could not open.
+    pub fn keep_texts_in_memory(&mut self) {
+        self.texts_in_db = false;
     }
 
     /// Replaces the list configs and user rules (a config reload) and applies them at
@@ -474,6 +484,7 @@ impl<F: Fetch> Lists<F> {
     async fn rebuild(&self) -> Result<(RuleSet, Vec<ListStats>)> {
         let conf = self.conf();
         let dir = self.dir.clone();
+        let db = self.texts_in_db.then(|| self.db.clone());
         tokio::task::spawn_blocking(move || {
             let bodies: Vec<(u32, String)> = conf
                 .lists
@@ -495,7 +506,7 @@ impl<F: Fetch> Lists<F> {
                 )
                 .collect();
             let refs: Vec<(u32, &str)> = bodies.iter().map(|(id, b)| (*id, b.as_str())).collect();
-            RuleSet::build(&conf.user_rules, &refs)
+            build(&conf.user_rules, &refs, db.as_deref())
         })
         .await
         .context("rebuilding the rule set")
@@ -556,6 +567,73 @@ impl<F: Fetch> Lists<F> {
                 None
             }
         }
+    }
+}
+
+/// Builds with ids from `rule_texts` in `db`. DNS never depends on the database: without
+/// one, or when it fails mid-build, the set keeps its texts in memory instead.
+fn build(
+    user_rules: &[String],
+    lists: &[(u32, &str)],
+    db: Option<&Path>,
+) -> (RuleSet, Vec<ListStats>) {
+    let Some(db) = db else {
+        return RuleSet::build(user_rules, lists);
+    };
+    let stored = connect(db).and_then(|conn| {
+        let mut ids = StoredIds::new(&conn)?;
+        RuleSet::build_with(user_rules, lists, &mut ids)
+    });
+    match stored {
+        Ok(built) => built,
+        Err(e) => {
+            warn!("rule texts unavailable, keeping them in memory for this build: {e}");
+            RuleSet::build(user_rules, lists)
+        }
+    }
+}
+
+/// Rule ids from `rule_texts`. Lookups are plain reads, which WAL never makes wait; only
+/// texts not stored yet (user rules, a body saved before the database existed) take the
+/// write lock, `RULE_CHUNK` per transaction, as the list save does.
+struct StoredIds<'c> {
+    conn: &'c Connection,
+    find: Statement<'c>,
+}
+
+impl<'c> StoredIds<'c> {
+    fn new(conn: &'c Connection) -> rusqlite::Result<Self> {
+        let find = conn.prepare("SELECT id FROM rule_texts WHERE list_id = ?1 AND text = ?2")?;
+        Ok(StoredIds { conn, find })
+    }
+}
+
+impl RuleIds for StoredIds<'_> {
+    type Error = rusqlite::Error;
+    const CHUNK: usize = RULE_CHUNK;
+
+    fn find(&mut self, list_id: u32, text: &str) -> rusqlite::Result<Option<u32>> {
+        // An id past u32 fails the get, and so the build, rather than wrapping.
+        self.find
+            .query_row((list_id, text), |r| r.get(0))
+            .optional()
+    }
+
+    fn insert(&mut self, texts: &[(u32, String)]) -> rusqlite::Result<Vec<u32>> {
+        // IMMEDIATE, the connection's default: waits up to busy_timeout for the writer.
+        let conn = self.conn;
+        let tx = conn.unchecked_transaction()?;
+        let mut ids = Vec::with_capacity(texts.len());
+        {
+            let mut put =
+                tx.prepare("INSERT OR IGNORE INTO rule_texts (list_id, text) VALUES (?1, ?2)")?;
+            for (list_id, text) in texts {
+                put.execute((list_id, text))?;
+                ids.push(self.find.query_row((list_id, text), |r| r.get(0))?);
+            }
+        }
+        tx.commit()?;
+        Ok(ids)
     }
 }
 
@@ -651,8 +729,9 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::dns::pipeline::shared;
-    use crate::dns::pipeline::testing::{upstreams, State};
-    use crate::rules::Verdict;
+    use crate::dns::pipeline::testing::{pipeline, query, upstreams, State};
+    use crate::dns::pipeline::QueryRecord;
+    use crate::rules::{RuleRef, Verdict};
     use crate::store::testing::TempDb;
     use crate::store::Store;
     use rusqlite::OptionalExtension;
@@ -841,6 +920,109 @@ mod tests {
         assert!(r.blocks("adnet.com"));
         assert!(r.blocks("user-blocked.test"), "user rules are in the set");
         assert!(!r.blocks("disabled.com"));
+    }
+
+    /// The live set names rules by `rule_texts` id, never by text. A record built against
+    /// one set and written after the next set is swapped in still names its rule: ids are
+    /// never deleted or reused, and a rule kept by both builds keeps its id.
+    #[tokio::test]
+    async fn records_name_rules_by_id_that_outlives_a_swap() {
+        const CLIENT: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 50));
+        let r = rig("ids");
+        r.fetch.set(URL1, Ok("||gone.test^\n||kept.test^\n"));
+        r.lists.refresh().await;
+        let state = Arc::new(State::default());
+        let p = pipeline(Arc::clone(&r.rules), &state);
+        let (_, gone) = p.handle(query("gone.test.", RecordType::A), CLIENT).await;
+        let (_, user) = p
+            .handle(query("user-blocked.test.", RecordType::A), CLIENT)
+            .await;
+        let id = |rec: &QueryRecord| match rec.rule {
+            Some(RuleRef::Id(id)) => id,
+            ref other => panic!("{:?} is not an id", other),
+        };
+        let kept_before = id(&p.handle(query("kept.test.", RecordType::A), CLIENT).await.1);
+        assert_eq!(gone.list_id, Some(1));
+        assert_eq!(user.list_id, Some(0), "user rules get an id too");
+
+        r.fetch.set(URL1, Ok("||kept.test^\n||new.test^\n"));
+        assert!(r.lists.refresh().await.swapped);
+        assert!(!r.blocks("gone.test"));
+        let kept_after = id(&p.handle(query("kept.test.", RecordType::A), CLIENT).await.1);
+        assert_eq!(kept_before, kept_after);
+
+        // Written after the swap, as the log writer would a record still in its channel.
+        let mut store = Store::open(&r.db.0).unwrap();
+        store.insert_for_test(&[gone.clone(), user.clone()]);
+        let mut rules: Vec<(String, i64)> = rusqlite::Connection::open(&r.db.0)
+            .unwrap()
+            .prepare("SELECT rule, list_id FROM queries ORDER BY rule")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        rules.sort();
+        assert_eq!(
+            rules,
+            vec![
+                ("||gone.test^".to_string(), 1),
+                ("||user-blocked.test^".to_string(), 0)
+            ]
+        );
+        let text = crate::store::rule_text(&r.db.0, id(&gone)).unwrap();
+        assert_eq!(
+            text.as_deref(),
+            Some("||gone.test^"),
+            "what test_domain reads"
+        );
+    }
+
+    /// With the query log down (R19) the set keeps its texts and DNS blocks as before,
+    /// whether the log was refused at startup or the database fails during a build.
+    #[tokio::test]
+    async fn rules_serve_with_texts_in_memory_without_the_store() {
+        let mut r = rig("memory");
+        r.lists.keep_texts_in_memory();
+        r.fetch.set(URL1, Ok("||adnet.com^\n"));
+        r.lists.refresh().await;
+        let set = Arc::clone(&r.rules.read().unwrap());
+        assert_eq!(
+            set.check("x.adnet.com"),
+            Verdict::Block {
+                list_id: 1,
+                rule: "||adnet.com^".into()
+            }
+        );
+
+        // A database that cannot be opened: the build falls back instead of failing.
+        let dir = std::env::temp_dir().join(format!("lacuna-lists-nodb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("1.txt"), "||adnet.com^\n").unwrap();
+        let rules = shared(RuleSet::default());
+        let lists = Lists::new(
+            vec![cfg(1, "First", URL1, true)],
+            vec!["||user-blocked.test^".to_string()],
+            dir.clone(),
+            dir.join("no/such/dir/lacuna.db"),
+            Arc::clone(&rules),
+            FakeFetch::default(),
+        );
+        lists.load_last_good().await.unwrap();
+        let set = Arc::clone(&rules.read().unwrap());
+        assert_eq!(
+            set.check("adnet.com"),
+            Verdict::Block {
+                list_id: 1,
+                rule: "||adnet.com^".into()
+            }
+        );
+        assert!(matches!(
+            set.check("user-blocked.test"),
+            Verdict::Block { list_id: 0, .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1247,5 +1429,123 @@ mod tests {
         assert_eq!(first_v4(&m, "x.test").unwrap_err(), "x.test: NXDOMAIN");
         m.metadata.response_code = ResponseCode::NoError;
         assert_eq!(first_v4(&m, "x.test").unwrap_err(), "x.test: no A record");
+    }
+
+    /// Memory and time with the real AdGuard DNS filter. Release build, one scenario per
+    /// process, with `LACUNA_FILTER` naming filter_1.txt and `LACUNA_DB` a database path:
+    /// first `real_filter_fresh_db` (creates the database, every text missing), then
+    /// `real_filter_rebuild_stored` and `real_filter_rebuild_in_memory`, each with
+    /// `-- --ignored --exact <name> --nocapture`.
+    fn real_filter() -> (String, PathBuf) {
+        let filter = std::env::var("LACUNA_FILTER").expect("LACUNA_FILTER names filter_1.txt");
+        let db = std::env::var("LACUNA_DB").expect("LACUNA_DB names the database");
+        (filter, PathBuf::from(db))
+    }
+
+    /// Times each write transaction of a build.
+    struct Timed<'c> {
+        ids: StoredIds<'c>,
+        inserts: usize,
+        longest: Duration,
+    }
+
+    impl RuleIds for Timed<'_> {
+        type Error = rusqlite::Error;
+        const CHUNK: usize = RULE_CHUNK;
+
+        fn find(&mut self, list_id: u32, text: &str) -> rusqlite::Result<Option<u32>> {
+            self.ids.find(list_id, text)
+        }
+
+        fn insert(&mut self, texts: &[(u32, String)]) -> rusqlite::Result<Vec<u32>> {
+            let start = std::time::Instant::now();
+            let ids = self.ids.insert(texts);
+            self.inserts += 1;
+            self.longest = self.longest.max(start.elapsed());
+            ids
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn real_filter_fresh_db() {
+        let (filter, db) = real_filter();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+        }
+        Store::open(&db).unwrap();
+        let body = std::fs::read_to_string(filter).unwrap();
+        let conn = connect(&db).unwrap();
+        let mut timed = Timed {
+            ids: StoredIds::new(&conn).unwrap(),
+            inserts: 0,
+            longest: Duration::ZERO,
+        };
+        let start = std::time::Instant::now();
+        let (set, _) = RuleSet::build_with(&[], &[(1, &body)], &mut timed).unwrap();
+        println!(
+            "fresh db: rules={} build_ms={} write_transactions={} longest_write_ms={}",
+            set.rule_count(),
+            start.elapsed().as_millis(),
+            timed.inserts,
+            timed.longest.as_millis()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn real_filter_rebuild_stored() {
+        let (filter, db) = real_filter();
+        measure_rebuild(&filter, Some(&db));
+    }
+
+    #[test]
+    #[ignore]
+    fn real_filter_rebuild_in_memory() {
+        let (filter, _) = real_filter();
+        measure_rebuild(&filter, None);
+    }
+
+    /// A rebuild as `Lists::rebuild` runs one: the body read from disk, built, dropped,
+    /// while the previous set is still live. VmHWM is reset just before it, so the peak
+    /// is the rebuild's own.
+    fn measure_rebuild(filter: &str, db: Option<&Path>) {
+        let rebuild = || {
+            let body = std::fs::read_to_string(filter).unwrap();
+            let start = std::time::Instant::now();
+            let (set, _) = build(&[], &[(1, &body)], db);
+            (set, start.elapsed())
+        };
+        let start = status_kib("VmRSS");
+        let (old, took) = rebuild();
+        let steady = status_kib("VmRSS");
+        // Writing 5 to clear_refs resets VmHWM to the current RSS.
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+        let before = status_kib("VmRSS");
+        let (new, _) = rebuild();
+        let peak = status_kib("VmHWM");
+        drop(old);
+        println!(
+            "texts in {}: rules={} est_bytes={} build_ms={} set_rss_kib={} \
+             rebuild_peak_delta_kib={} (rss before {before}, peak {peak})",
+            if db.is_some() { "db" } else { "memory" },
+            new.rule_count(),
+            new.estimated_bytes(),
+            took.as_millis(),
+            steady.saturating_sub(start),
+            peak.saturating_sub(before),
+        );
+    }
+
+    /// A field of /proc/self/status in KiB (Linux only).
+    fn status_kib(field: &str) -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            })
+            .unwrap_or(0)
     }
 }

@@ -37,7 +37,8 @@ use crate::dns::answer::rewrite_for;
 use crate::dns::pipeline::{current, LiveConfig, Pipeline, Shared};
 use crate::dns::upstream::Upstream;
 use crate::lists::{Fetch, Lists};
-use crate::rules::{RuleSet, Verdict};
+use crate::rules::{RuleRef, RuleSet, Verdict};
+use crate::store;
 use manifest::{ActionId, PAUSE_MINUTES};
 use readonly::{run_query, Frame, ParamValue, QueryError, QueryLimits};
 
@@ -379,7 +380,7 @@ async fn action<F: Fetch + 'static, U: Upstream + 'static>(
             (ok, report.summary())
         }
         ActionId::ReloadConfig => reload_config(rt).await,
-        ActionId::TestDomain => test_domain(rt, &req.params),
+        ActionId::TestDomain => test_domain(rt, &req.params).await,
     };
     info!(action = id, ok, "{message}");
     json_response(
@@ -477,7 +478,7 @@ async fn reload_config<F: Fetch + 'static, U: Upstream>(rt: &Runtime<F, U>) -> (
 
 /// What lacuna would answer for a name, in the pipeline's order: refused names,
 /// rewrites, then the rules. `ok` is false only for a name that is not one.
-fn test_domain<F: Fetch, U: Upstream + 'static>(
+async fn test_domain<F: Fetch, U: Upstream + 'static>(
     rt: &Runtime<F, U>,
     params: &Map<String, Value>,
 ) -> (bool, String) {
@@ -505,14 +506,19 @@ fn test_domain<F: Fetch, U: Upstream + 'static>(
             .list_name(id)
             .unwrap_or_else(|| format!("list {id}"))
     };
-    let verdict = match current(&rt.rules).check(&name) {
+    let text = |rule| rule_text(&rt.db_path, rule);
+    let verdict = current(&rt.rules).check(&name);
+    let verdict = match verdict {
         Verdict::Pass => return (true, "allowed".to_string()),
         Verdict::Allow { list_id, rule } => {
-            return (true, format!("allowed by {rule} ({})", list(list_id)))
+            let rule = text(rule).await;
+            return (true, format!("allowed by {rule} ({})", list(list_id)));
         }
-        Verdict::Block { list_id, rule } => format!("blocked by {rule} ({})", list(list_id)),
+        Verdict::Block { list_id, rule } => {
+            format!("blocked by {} ({})", text(rule).await, list(list_id))
+        }
         Verdict::HostsIp { ip, list_id, rule } => {
-            format!("answered {ip} by {rule} ({})", list(list_id))
+            format!("answered {ip} by {} ({})", text(rule).await, list(list_id))
         }
     };
     if rt.pipeline.is_paused_now() {
@@ -522,6 +528,23 @@ fn test_domain<F: Fetch, U: Upstream + 'static>(
         )
     } else {
         (true, verdict)
+    }
+}
+
+/// A rule's text for a message: the set's own copy, or one lookup in `rule_texts` (the
+/// set holds only ids), off the async threads.
+async fn rule_text(db: &Path, rule: RuleRef) -> String {
+    match rule {
+        RuleRef::Text(text) => text.to_string(),
+        RuleRef::Id(id) => {
+            let db = db.to_path_buf();
+            match tokio::task::spawn_blocking(move || store::rule_text(&db, id)).await {
+                Ok(Ok(Some(text))) => text,
+                Ok(Ok(None)) => format!("rule {id} (not in rule_texts)"),
+                Ok(Err(e)) => format!("rule {id} (text unavailable: {e:#})"),
+                Err(e) => format!("rule {id} (text unavailable: {e})"),
+            }
+        }
     }
 }
 
@@ -1043,7 +1066,7 @@ mod tests {
                 assert!(expected >= 5, "the seed covers the range: {expected}");
                 let mut never: Vec<&str> = ["||adnet.com^", "||never.test^", "||partial.test^"]
                     .into_iter()
-                    .filter(|rule| !picked.iter().any(|q| q.rule.as_deref() == Some(*rule)))
+                    .filter(|rule| !picked.iter().any(|q| q.rule == Some((*rule).into())))
                     .collect();
                 never.sort_unstable();
 

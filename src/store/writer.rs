@@ -16,6 +16,7 @@ use tracing::{info, warn};
 use super::{rollup, Store, LOG_DROPPED, LOG_LATE, QUERIES_TOTAL};
 use crate::codes::Source;
 use crate::dns::pipeline::{LogSink, QueryRecord};
+use crate::rules::RuleRef;
 
 /// Records the channel holds before `send` starts dropping (about 2 MB at most).
 pub const CHANNEL_CAPACITY: usize = 8192;
@@ -203,9 +204,10 @@ fn add_counter(tx: &Transaction, name: &str, by: u64) -> Result<()> {
     Ok(())
 }
 
-/// Inserts raw rows, interning domain names and rule texts and recording each client
-/// as seen. Rows behind the rollup marks are added to the rollups here, so they count
-/// exactly once; returns how many there were. Counters are the caller's business.
+/// Inserts raw rows, interning domain names (and rule texts, for a rule given as text)
+/// and recording each client as seen. Rows behind the rollup marks are added to the
+/// rollups here, so they count exactly once; returns how many there were. Counters are
+/// the caller's business.
 pub fn insert_batch(tx: &Transaction, records: &[QueryRecord], source: Source) -> Result<u64> {
     let before = insert_rows(tx, records, source)?;
     rollup::roll_late(tx, before)
@@ -295,16 +297,21 @@ fn insert_rows(tx: &Connection, records: &[QueryRecord], source: Source) -> Resu
             r.rule.is_some(),
             "list_id and rule differ"
         );
-        let rule_id = match (r.list_id, r.rule.as_deref()) {
-            (Some(list), Some(text)) => Some(match rules.get(&(list, text)) {
-                Some(&id) => id,
-                None => {
-                    put_rule.execute(params![list, text])?;
-                    let id: i64 = get_rule.query_row(params![list, text], |row| row.get(0))?;
-                    rules.insert((list, text), id);
-                    id
-                }
-            }),
+        let rule_id = match (r.list_id, &r.rule) {
+            // Interned when the rule set was built; the row outlives that set.
+            (Some(_), Some(RuleRef::Id(id))) => Some(i64::from(*id)),
+            (Some(list), Some(RuleRef::Text(text))) => {
+                let text: &str = text;
+                Some(match rules.get(&(list, text)) {
+                    Some(&id) => id,
+                    None => {
+                        put_rule.execute(params![list, text])?;
+                        let id: i64 = get_rule.query_row(params![list, text], |row| row.get(0))?;
+                        rules.insert((list, text), id);
+                        id
+                    }
+                })
+            }
             _ => None,
         };
         let answers = r

@@ -17,14 +17,15 @@ use super::cache::{Cache, CacheKey, Lookup};
 use super::upstream::{Remote, Upstream, UpstreamError, Upstreams};
 use crate::codes::{Outcome, Reason, ServedFrom};
 use crate::config::{Config, Rewrite};
-use crate::rules::{RuleSet, Verdict};
+use crate::rules::{RuleRef, RuleSet, Verdict};
 
 /// Entries in the answer cache. Sized from the house's own traffic: distinct allowed
-/// (name, type) pairs in the imported AdGuard history were 2,217 in 12 h, 4,901 in 24 h
-/// and 9,607 in 7 days, so 8,000 holds more than a day of names. The cache fills to its
-/// cap and stays there; 20,000 entries measured 41,496 KiB for CNAME plus 4 A answers
-/// (about 2.1 KB each), which would have pushed a rebuild past AdGuard's 81 MiB.
-const CACHE_ENTRIES: usize = 8_000;
+/// (name, type) pairs in the imported AdGuard history were 2,217 in 12 h and 4,901 in
+/// 24 h. An entry is served stale for 12 h past its expiry, so 4,000 holds every name of
+/// that window with room to spare and most of a day. The cache fills to its cap and stays
+/// there at about 2 KB an entry: in shadow, 8,000 entries took RSS from 54 to 69 MB and a
+/// rule rebuild on top of that peaked at 100 MB, at the 96 MiB container limit.
+const CACHE_ENTRIES: usize = 4_000;
 
 /// One handled query, as the log writer stores it.
 #[derive(Debug, Clone)]
@@ -39,7 +40,7 @@ pub struct QueryRecord {
     pub outcome: Outcome,
     pub reason: Reason,
     pub list_id: Option<u32>,
-    pub rule: Option<Arc<str>>,
+    pub rule: Option<RuleRef>,
     pub served_from: ServedFrom,
     pub upstream: Option<String>,
     pub latency_us: u32,
@@ -154,7 +155,7 @@ struct Decision {
     outcome: Outcome,
     reason: Reason,
     served_from: ServedFrom,
-    rule: Option<(u32, Arc<str>)>,
+    rule: Option<(u32, RuleRef)>,
     upstream: Option<String>,
 }
 
@@ -169,7 +170,7 @@ impl Decision {
         }
     }
 
-    fn by_rule(outcome: Outcome, reason: Reason, list_id: u32, rule: Arc<str>) -> Self {
+    fn by_rule(outcome: Outcome, reason: Reason, list_id: u32, rule: RuleRef) -> Self {
         Decision {
             rule: Some((list_id, rule)),
             ..Decision::local(outcome, reason)
@@ -179,7 +180,7 @@ impl Decision {
     /// Passed the filters; `allowed_by` is the allow rule that let it through, if any.
     fn allowed(
         served_from: ServedFrom,
-        allowed_by: Option<(u32, Arc<str>)>,
+        allowed_by: Option<(u32, RuleRef)>,
         upstream: Option<String>,
     ) -> Self {
         Decision {
@@ -410,7 +411,7 @@ fn cache_key(query: &Message, q: &hickory_proto::op::Query, name: &str) -> Cache
 }
 
 /// The first CNAME target in the answer that the rules block.
-fn blocked_cname(rules: &RuleSet, resp: &Message) -> Option<(u32, Arc<str>)> {
+fn blocked_cname(rules: &RuleSet, resp: &Message) -> Option<(u32, RuleRef)> {
     resp.answers.iter().find_map(|r| match &r.data {
         RData::CNAME(CNAME(target)) => match rules.check(&target.to_ascii()) {
             Verdict::Block { list_id, rule } => Some((list_id, rule)),
@@ -647,7 +648,7 @@ mod tests {
         assert_eq!(rec.outcome, Outcome::Blocked);
         assert_eq!(rec.reason, Reason::Rule);
         assert_eq!(rec.list_id, Some(1));
-        assert_eq!(rec.rule.as_deref(), Some("||adnet.com^"));
+        assert_eq!(rec.rule, Some("||adnet.com^".into()));
         assert_eq!(rec.served_from, ServedFrom::Local);
         assert_eq!(rec.upstream, None);
         assert_eq!(rec.rcode, Some(0));
@@ -687,7 +688,7 @@ mod tests {
         assert_eq!(rec.outcome, Outcome::Allowed);
         assert_eq!(rec.reason, Reason::Rule);
         assert_eq!(rec.list_id, Some(0));
-        assert_eq!(rec.rule.as_deref(), Some("@@||ok.adnet.com^"));
+        assert_eq!(rec.rule, Some("@@||ok.adnet.com^".into()));
         assert_eq!(rec.served_from, ServedFrom::Upstream);
         assert_eq!(rec.upstream.as_deref(), Some("doh"));
         assert_eq!(rec.answers, vec![ip(192, 0, 2, 1)]);
@@ -708,7 +709,7 @@ mod tests {
         assert_eq!(rec.outcome, Outcome::Blocked);
         assert_eq!(rec.reason, Reason::Cname);
         assert_eq!(rec.list_id, Some(1));
-        assert_eq!(rec.rule.as_deref(), Some("||adnet.com^"));
+        assert_eq!(rec.rule, Some("||adnet.com^".into()));
         assert_eq!(rec.served_from, ServedFrom::Local);
 
         // The cache holds the answer as received and the check runs again on a hit.
@@ -733,7 +734,7 @@ mod tests {
         let (resp, rec) = p.handle(query("a.com.", RecordType::A), CLIENT).await;
         assert_eq!(first_a(&resp), Some((Ipv4Addr::UNSPECIFIED, BLOCKED_TTL)));
         assert_eq!(rec.reason, Reason::Cname);
-        assert_eq!(rec.rule.as_deref(), Some("||track.*.com^"));
+        assert_eq!(rec.rule, Some("||track.*.com^".into()));
     }
 
     #[tokio::test(start_paused = true)]
@@ -949,7 +950,7 @@ mod tests {
         assert_eq!(rec.outcome, Outcome::Allowed);
         assert_eq!(rec.reason, Reason::Rule);
         assert_eq!(rec.list_id, Some(0));
-        assert_eq!(rec.rule.as_deref(), Some("@@||ok.adnet.com^"));
+        assert_eq!(rec.rule, Some("@@||ok.adnet.com^".into()));
     }
 
     #[tokio::test(start_paused = true)]

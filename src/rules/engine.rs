@@ -1,7 +1,12 @@
 //! The rule set: every list's rules in one map, queried by walking a name's suffixes, plus a
 //! small pattern table for the rules a suffix lookup cannot express.
+//!
+//! Rule text is not kept here. A built set holds each rule's `rule_texts` id and the text
+//! is looked up off the DNS path (the log writer, the API), so ~200k texts cost the
+//! process nothing. When the store cannot be reached the set keeps the texts instead.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::Infallible;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -9,23 +14,73 @@ use std::sync::Arc;
 use super::pattern::PatternTable;
 use super::{parse_line, Parsed, Rule, RuleKind, Target};
 
+/// The rule a verdict names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleRef {
+    /// `rule_texts.id`. Rows there are never deleted, so an id is never reused and stays
+    /// valid after the set that handed it out is swapped away: a record built against the
+    /// old set and written after the swap still names its rule.
+    Id(u32),
+    /// The text itself, from a set built without the store.
+    Text(Arc<str>),
+}
+
+#[cfg(test)]
+impl From<&str> for RuleRef {
+    fn from(text: &str) -> Self {
+        RuleRef::Text(text.into())
+    }
+}
+
 /// What the rules say about one name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Pass,
     Block {
         list_id: u32,
-        rule: Arc<str>,
+        rule: RuleRef,
     },
     Allow {
         list_id: u32,
-        rule: Arc<str>,
+        rule: RuleRef,
     },
     HostsIp {
         ip: IpAddr,
         list_id: u32,
-        rule: Arc<str>,
+        rule: RuleRef,
     },
+}
+
+/// Hands a build the id of each rule it keeps. The store's implementation reads ids from
+/// `rule_texts` and writes the texts it does not have yet.
+pub trait RuleIds {
+    type Error;
+    /// Texts the build gathers for one `insert`; each insert is one write transaction.
+    const CHUNK: usize;
+    /// The id of `text` in list `list_id`, if it has one yet.
+    fn find(&mut self, list_id: u32, text: &str) -> Result<Option<u32>, Self::Error>;
+    /// Gives every text an id, in order.
+    fn insert(&mut self, texts: &[(u32, String)]) -> Result<Vec<u32>, Self::Error>;
+}
+
+/// Ids are indices into the texts it keeps: the build without a store.
+#[derive(Default)]
+struct InMemory(Vec<Arc<str>>);
+
+impl RuleIds for InMemory {
+    type Error = Infallible;
+    // `find` always has an id, so nothing is ever waiting for `insert`.
+    const CHUNK: usize = usize::MAX;
+
+    fn find(&mut self, _: u32, text: &str) -> Result<Option<u32>, Infallible> {
+        self.0.push(text.into());
+        // A list has far fewer than 4 billion lines; saturating keeps this total.
+        Ok(Some(u32::try_from(self.0.len() - 1).unwrap_or(u32::MAX)))
+    }
+
+    fn insert(&mut self, _: &[(u32, String)]) -> Result<Vec<u32>, Infallible> {
+        Ok(Vec::new())
+    }
 }
 
 /// Per-list parse outcome, for the list manager to store and show.
@@ -37,11 +92,12 @@ pub struct ListStats {
     pub skipped: BTreeMap<String, usize>,
 }
 
-/// Where a rule came from and its text; lives in the arena, referenced by index.
-#[derive(Debug)]
+/// Where a rule came from; lives in the arena, referenced by index. `rule` is a
+/// `rule_texts` id, or an index into `RuleSet::texts` when the set keeps its texts.
+#[derive(Debug, Clone, Copy)]
 struct Origin {
     list_id: u32,
-    rule: Arc<str>,
+    rule: u32,
 }
 
 /// 1-based index into `RuleSet::origins`; `None` costs nothing extra thanks to the niche.
@@ -96,6 +152,8 @@ impl Entry {
 #[derive(Debug, Default)]
 pub struct RuleSet {
     origins: Vec<Origin>,
+    /// Rule texts, indexed by `Origin::rule`, for a set built without the store only.
+    texts: Option<Vec<Arc<str>>>,
     /// Rules that cover the name and every subdomain (`||domain^`, plain domains).
     suffix: HashMap<Box<str>, Entry>,
     /// Hosts-syntax null-IP blocks: the exact name only.
@@ -120,101 +178,192 @@ fn badfilter_twin(text: &str) -> String {
     }
 }
 
-/// Parse every line into `rules`, counting skips; blank lines count as neither.
-fn parse_into<'a>(
-    list_id: u32,
-    lines: impl Iterator<Item = &'a str>,
-    rules: &mut Vec<(u32, Rule)>,
-) -> ListStats {
-    let mut st = ListStats {
-        list_id,
-        parsed: 0,
-        skipped: BTreeMap::new(),
-    };
-    for line in lines {
-        match parse_line(line) {
-            Parsed::Rule(rule) => {
-                st.parsed += 1;
-                rules.push((list_id, rule));
+type Lines<'a> = Box<dyn Iterator<Item = &'a str> + 'a>;
+
+/// Every source's lines in load order: the user rules (list 0, one rule per entry), then
+/// each list body.
+fn sources<'a>(
+    user_rules: &'a [String],
+    lists: &'a [(u32, &'a str)],
+) -> impl Iterator<Item = (u32, Lines<'a>)> {
+    let user: Lines<'a> = Box::new(user_rules.iter().map(String::as_str));
+    let bodies = lists
+        .iter()
+        .map(|(id, body)| (*id, Box::new(body.lines()) as Lines<'a>));
+    std::iter::once((0, user)).chain(bodies)
+}
+
+/// The texts every badfilter rule cancels. A user badfilter (list 0) cancels any twin; a
+/// list's badfilter cancels list rules only.
+#[derive(Default)]
+struct Cancelled {
+    by_user: HashSet<String>,
+    by_lists: HashSet<String>,
+}
+
+impl Cancelled {
+    fn find(user_rules: &[String], lists: &[(u32, &str)]) -> Cancelled {
+        let mut found = Cancelled::default();
+        for (list_id, lines) in sources(user_rules, lists) {
+            // Only a line naming the modifier can be a badfilter rule; the rest skip the parser.
+            for line in lines.filter(|l| l.contains("badfilter")) {
+                if let Parsed::Rule(rule) = parse_line(line) {
+                    if rule.badfilter {
+                        let twins = if list_id == 0 {
+                            &mut found.by_user
+                        } else {
+                            &mut found.by_lists
+                        };
+                        twins.insert(badfilter_twin(&rule.text));
+                    }
+                }
             }
-            Parsed::Skip(reason) => *st.skipped.entry(reason.label()).or_insert(0) += 1,
-            Parsed::Blank => {}
         }
+        found
     }
-    st
+
+    fn cancels(&self, list_id: u32, rule: &Rule) -> bool {
+        rule.badfilter
+            || self.by_user.contains(&rule.text)
+            || (list_id != 0 && self.by_lists.contains(&rule.text))
+    }
+}
+
+/// Rules waiting for an id from `RuleIds::insert`: their arena slots and texts.
+#[derive(Default)]
+struct Missing {
+    at: Vec<usize>,
+    texts: Vec<(u32, String)>,
 }
 
 impl RuleSet {
-    /// User rules are list 0 and load first, so they win ties against lists.
+    /// Builds a set that keeps its rule texts: for tests, the user-rule set DNS starts
+    /// with, and a store that cannot be reached. User rules are list 0 and load first, so
+    /// they win ties against lists.
     pub fn build(user_rules: &[String], lists: &[(u32, &str)]) -> (RuleSet, Vec<ListStats>) {
-        let mut rules: Vec<(u32, Rule)> = Vec::new();
-        // Each user rule is one line; list bodies are walked in place, never copied.
-        let mut stats = vec![parse_into(
-            0,
-            user_rules.iter().map(String::as_str),
-            &mut rules,
-        )];
-        for (list_id, body) in lists {
-            stats.push(parse_into(*list_id, body.lines(), &mut rules));
-        }
-
-        // Badfilter applies across lists, so it can only run once every list is read.
-        // A user badfilter (list 0) cancels any twin; a list's badfilter cancels list rules only.
-        let twins = |from_user: bool| -> HashSet<String> {
-            rules
-                .iter()
-                .filter(|(id, r)| r.badfilter && (*id == 0) == from_user)
-                .map(|(_, r)| badfilter_twin(&r.text))
-                .collect()
-        };
-        let (by_user, by_lists) = (twins(true), twins(false));
-        let mut set = RuleSet::default();
-        for (list_id, rule) in rules {
-            let Rule {
-                target,
-                kind,
-                important,
-                badfilter,
-                text,
-            } = rule;
-            if badfilter || by_user.contains(&text) || (list_id != 0 && by_lists.contains(&text)) {
-                continue;
-            }
-            set.count += 1;
-            set.origins.push(Origin {
-                list_id,
-                rule: Arc::from(text),
-            });
-            // Safe: the vec was just pushed to, so its length is at least 1.
-            let Some(index) = NonZeroU32::new(set.origins.len() as u32) else {
-                continue;
-            };
-            let class = Class::of(&kind, important);
-            match (target, kind, class) {
-                (Target::Exact(name), RuleKind::HostsIp(ip), _) => {
-                    set.hosts_ip
-                        .entry(name.into_boxed_str())
-                        .or_insert((ip, index));
-                }
-                // The parser makes exact targets only for hosts lines, so this is a block.
-                (Target::Exact(name), _, _) => {
-                    set.exact_block
-                        .entry(name.into_boxed_str())
-                        .or_insert(index);
-                }
-                (Target::Suffix(domain), _, Some(class)) => set
-                    .suffix
-                    .entry(domain.into_boxed_str())
-                    .or_default()
-                    .keep_first(class, index),
-                (Target::Pattern(pattern), _, Some(class)) => {
-                    set.patterns.insert(pattern, (class, index));
-                }
-                // No class means a hosts IP, and the parser gives those exact targets only.
-                (Target::Suffix(_) | Target::Pattern(_), _, None) => {}
-            }
-        }
+        let mut texts = InMemory::default();
+        let Ok((mut set, stats)) = RuleSet::build_with(user_rules, lists, &mut texts);
+        texts.0.shrink_to_fit();
+        set.texts = Some(texts.0);
         (set, stats)
+    }
+
+    /// Builds a set that holds each rule's id from `ids`, never its text.
+    ///
+    /// Each body is parsed twice rather than holding ~200k parsed rules at once: a
+    /// badfilter may cancel a rule loaded before it, so the first pass finds the cancelled
+    /// texts and the second fills the tables, each rule's text dropped once it has an id.
+    pub fn build_with<I: RuleIds>(
+        user_rules: &[String],
+        lists: &[(u32, &str)],
+        ids: &mut I,
+    ) -> Result<(RuleSet, Vec<ListStats>), I::Error> {
+        let cancelled = Cancelled::find(user_rules, lists);
+        let mut set = RuleSet::default();
+        let mut missing = Missing::default();
+        let mut stats = Vec::with_capacity(lists.len() + 1);
+        for (list_id, lines) in sources(user_rules, lists) {
+            let mut st = ListStats {
+                list_id,
+                parsed: 0,
+                skipped: BTreeMap::new(),
+            };
+            for line in lines {
+                match parse_line(line) {
+                    Parsed::Rule(rule) => {
+                        st.parsed += 1;
+                        if !cancelled.cancels(list_id, &rule) {
+                            set.add(list_id, rule, ids, &mut missing)?;
+                        }
+                    }
+                    Parsed::Skip(reason) => *st.skipped.entry(reason.label()).or_insert(0) += 1,
+                    Parsed::Blank => {}
+                }
+            }
+            stats.push(st);
+        }
+        set.fill_missing(ids, &mut missing)?;
+        set.origins.shrink_to_fit();
+        Ok((set, stats))
+    }
+
+    fn add<I: RuleIds>(
+        &mut self,
+        list_id: u32,
+        rule: Rule,
+        ids: &mut I,
+        missing: &mut Missing,
+    ) -> Result<(), I::Error> {
+        let Rule {
+            target,
+            kind,
+            important,
+            text,
+            ..
+        } = rule;
+        let id = match ids.find(list_id, &text)? {
+            Some(id) => id,
+            None => {
+                // A placeholder until `fill_missing` writes the real id over it.
+                missing.at.push(self.origins.len());
+                missing.texts.push((list_id, text));
+                0
+            }
+        };
+        self.count += 1;
+        self.origins.push(Origin { list_id, rule: id });
+        if missing.texts.len() >= I::CHUNK {
+            self.fill_missing(ids, missing)?;
+        }
+        // Safe: the vec was just pushed to, so its length is at least 1.
+        let Some(index) = NonZeroU32::new(self.origins.len() as u32) else {
+            return Ok(());
+        };
+        let class = Class::of(&kind, important);
+        match (target, kind, class) {
+            (Target::Exact(name), RuleKind::HostsIp(ip), _) => {
+                self.hosts_ip
+                    .entry(name.into_boxed_str())
+                    .or_insert((ip, index));
+            }
+            // The parser makes exact targets only for hosts lines, so this is a block.
+            (Target::Exact(name), _, _) => {
+                self.exact_block
+                    .entry(name.into_boxed_str())
+                    .or_insert(index);
+            }
+            (Target::Suffix(domain), _, Some(class)) => self
+                .suffix
+                .entry(domain.into_boxed_str())
+                .or_default()
+                .keep_first(class, index),
+            (Target::Pattern(pattern), _, Some(class)) => {
+                self.patterns.insert(pattern, (class, index));
+            }
+            // No class means a hosts IP, and the parser gives those exact targets only.
+            (Target::Suffix(_) | Target::Pattern(_), _, None) => {}
+        }
+        Ok(())
+    }
+
+    /// Stores the texts that had no id yet and writes their ids into the arena.
+    fn fill_missing<I: RuleIds>(
+        &mut self,
+        ids: &mut I,
+        missing: &mut Missing,
+    ) -> Result<(), I::Error> {
+        if missing.texts.is_empty() {
+            return Ok(());
+        }
+        let got = ids.insert(&missing.texts)?;
+        debug_assert_eq!(got.len(), missing.texts.len(), "one id per text");
+        for (at, id) in missing.at.drain(..).zip(got) {
+            if let Some(origin) = self.origins.get_mut(at) {
+                origin.rule = id;
+            }
+        }
+        missing.texts.clear();
+        Ok(())
     }
 
     pub fn rule_count(&self) -> usize {
@@ -225,6 +374,10 @@ impl RuleSet {
     #[allow(dead_code)] // Tests only so far; for sizing checks in Task 15.
     pub fn estimated_bytes(&self) -> usize {
         let keys = |it: &mut dyn Iterator<Item = &Box<str>>| it.map(|k| k.len()).sum::<usize>();
+        let texts = self.texts.as_ref().map_or(0, |t| {
+            t.capacity() * std::mem::size_of::<Arc<str>>()
+                + t.iter().map(|s| s.len() + 16).sum::<usize>()
+        });
         self.suffix.capacity() * (std::mem::size_of::<(Box<str>, Entry)>() + 1)
             + keys(&mut self.suffix.keys())
             + self.exact_block.capacity() * (std::mem::size_of::<(Box<str>, NonZeroU32)>() + 1)
@@ -232,16 +385,23 @@ impl RuleSet {
             + self.hosts_ip.capacity()
                 * (std::mem::size_of::<(Box<str>, (IpAddr, NonZeroU32))>() + 1)
             + self.origins.capacity() * std::mem::size_of::<Origin>()
-            + self.origins.iter().map(|o| o.rule.len()).sum::<usize>()
+            + texts
             + self.patterns.estimated_bytes()
     }
 
-    fn verdict(&self, index: NonZeroU32, make: impl FnOnce(u32, Arc<str>) -> Verdict) -> Verdict {
-        // Indices are only ever handed out by `build`, so the lookup cannot miss.
-        match self.origins.get(index.get() as usize - 1) {
-            Some(o) => make(o.list_id, o.rule.clone()),
-            None => Verdict::Pass,
-        }
+    fn verdict(&self, index: NonZeroU32, make: impl FnOnce(u32, RuleRef) -> Verdict) -> Verdict {
+        // Indices are only ever handed out by `build`, so the lookups cannot miss.
+        let Some(o) = self.origins.get(index.get() as usize - 1) else {
+            return Verdict::Pass;
+        };
+        let rule = match &self.texts {
+            None => RuleRef::Id(o.rule),
+            Some(texts) => match texts.get(o.rule as usize) {
+                Some(text) => RuleRef::Text(Arc::clone(text)),
+                None => return Verdict::Pass,
+            },
+        };
+        make(o.list_id, rule)
     }
 
     /// Precedence (AdGuard): important allow, important block, allow, block, hosts IP.
@@ -719,5 +879,69 @@ mod tests {
                     .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
             })
             .unwrap_or(0)
+    }
+
+    /// Ids in a map, two texts per insert, so a build crosses chunk boundaries.
+    #[derive(Default)]
+    struct MapIds {
+        ids: HashMap<(u32, String), u32>,
+        inserts: usize,
+    }
+
+    impl RuleIds for MapIds {
+        type Error = Infallible;
+        const CHUNK: usize = 2;
+
+        fn find(&mut self, list_id: u32, text: &str) -> Result<Option<u32>, Infallible> {
+            Ok(self.ids.get(&(list_id, text.to_string())).copied())
+        }
+
+        fn insert(&mut self, texts: &[(u32, String)]) -> Result<Vec<u32>, Infallible> {
+            self.inserts += 1;
+            let ids = texts
+                .iter()
+                .map(|key| {
+                    let next = 100 + self.ids.len() as u32;
+                    *self.ids.entry(key.clone()).or_insert(next)
+                })
+                .collect();
+            Ok(ids)
+        }
+    }
+
+    #[test]
+    fn stored_ids_replace_texts() {
+        let mut ids = MapIds::default();
+        ids.ids.insert((1, "||known.com^".into()), 7);
+        let body = "||known.com^\n||a.com^\n||b.com^\n||c.com^\n||a.com^\n||d.com^";
+        let Ok((set, stats)) =
+            RuleSet::build_with(&["||u.com^".to_string()], &[(1, body)], &mut ids);
+        assert!(set.texts.is_none(), "the set keeps no rule text");
+        assert_eq!((set.rule_count(), stats[1].parsed), (7, 6));
+        assert_eq!(
+            set.check("known.com"),
+            Verdict::Block {
+                list_id: 1,
+                rule: RuleRef::Id(7)
+            }
+        );
+        // Misses u+a, then b+c, fill a chunk each; the second `a` is found; d is the tail.
+        assert_eq!(ids.inserts, 3);
+        let id_of = |name: &str| match set.check(name) {
+            Verdict::Block {
+                rule: RuleRef::Id(id),
+                ..
+            } => id,
+            other => panic!("{name}: {other:?}"),
+        };
+        for (list_id, rule, name) in [
+            (0, "||u.com^", "u.com"),
+            (1, "||a.com^", "a.com"),
+            (1, "||b.com^", "b.com"),
+            (1, "||c.com^", "c.com"),
+            (1, "||d.com^", "d.com"),
+        ] {
+            assert_eq!(id_of(name), ids.ids[&(list_id, rule.to_string())], "{name}");
+        }
     }
 }

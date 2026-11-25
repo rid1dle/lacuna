@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use crate::codes::{Outcome, Reason, ServedFrom, Source};
 
@@ -152,6 +152,19 @@ impl Store {
         writer::insert_batch(&tx, records, Source::Lacuna).expect("test insert");
         tx.commit().expect("test commit");
     }
+}
+
+/// The text of rule `id` in `rule_texts`, read on a read-only connection of its own.
+pub fn rule_text(db: &Path, id: u32) -> Result<Option<String>> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(db, flags)
+        .with_context(|| format!("opening {}", db.display()))?;
+    let text = conn
+        .query_row("SELECT text FROM rule_texts WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    Ok(text)
 }
 
 /// No `meta` table: a new database, so create the tables. Version 1: keep them. Anything
