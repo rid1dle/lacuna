@@ -1137,6 +1137,55 @@ mod tests {
         assert_eq!(sum(&frame, "n"), whole_day);
     }
 
+    /// Ruling R37: the raw-only aggregates read at most the last 7 days of the range and
+    /// say so, since a 30-day raw scan timed out under DNS load.
+    #[tokio::test]
+    async fn raw_panels_read_at_most_seven_days() {
+        let r = rig("raw7", Setup::default());
+        let upstream = |ts: i64, ms: u32| QueryRecord {
+            served_from: ServedFrom::Upstream,
+            upstream: Some("doh".into()),
+            latency_us: ms * 1000,
+            ..record(ts, LAPTOP, "example.com")
+        };
+        // Old: three slow upstream answers. Recent: one cache hit, one fast upstream answer.
+        let mut records: Vec<QueryRecord> =
+            (0..3).map(|i| upstream(END - 20 * DAY + i, 900)).collect();
+        records.push(record(END - DAY, LAPTOP, "example.com"));
+        records.push(upstream(END - DAY + 1, 20));
+        let mut conn = rusqlite::Connection::open(&r.db.0).unwrap();
+        let tx = conn.transaction().unwrap();
+        writer::insert_batch(&tx, &records, Source::Lacuna).unwrap();
+        tx.commit().unwrap();
+
+        let month = Range {
+            from: END - 30 * DAY,
+            to: END,
+        };
+        let m = manifest(2);
+        let panel = |id: &str| {
+            m.dashboards
+                .iter()
+                .flat_map(|d| &d.panels)
+                .find(|p| p.id == id)
+                .unwrap()
+        };
+        let (status, frame) = r
+            .query(panel("cache_hit_rate").sql, params(&month, None, None))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{frame}");
+        // 1 hit of 2 in the last week; the whole month would say 1 of 5.
+        assert_eq!(column(&frame, "cache_hit_pct"), [json!(50.0)]);
+        let (status, frame) = r
+            .query(panel("upstream_latency").sql, params(&month, None, None))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{frame}");
+        assert_eq!(column(&frame, "avg_ms"), [json!(20.0)]);
+        for id in ["cache_hit_rate", "upstream_latency"] {
+            assert!(panel(id).title.ends_with("(last 7 days at most)"), "{id}");
+        }
+    }
+
     /// No default panel reads one of the big tables end to end, at either range length.
     #[test]
     fn default_panels_search_by_index() {

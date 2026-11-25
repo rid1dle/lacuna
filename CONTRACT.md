@@ -215,7 +215,9 @@ rolled up, and raw rows for the partial hour or day at the start and everything 
 the last whole rolled-up bucket (time series use hourly buckets up to 7 days, IST days
 beyond). Nothing is missed or counted twice. One approximation: when `from` is older
 than the raw rows kept (30 days), the hour or day holding `from` is counted whole.
-Panels whose title says "last 30 days at most" read raw rows only.
+Panels whose title says "last N days at most" read raw rows only, and only the last N
+days of the range: 30 (raw retention) for the domain lookups, 7 for cache hit % and
+upstream latency, which aggregate raw rows and timed out over a month under DNS load.
 Each default panel's SQL starts with comment lines explaining this, so a cloned panel
 keeps the explanation.
 

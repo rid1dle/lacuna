@@ -480,7 +480,7 @@ fn dashboards() -> Vec<Dashboard> {
                 },
                 Panel {
                     id: "cache_hit_rate",
-                    title: "Cache hit % (last 30 days at most)",
+                    title: "Cache hit % (last 7 days at most)",
                     kind: "stat",
                     sql: CACHE_HIT_RATE,
                     layout: at(4, 8, 4, 4),
@@ -496,7 +496,7 @@ fn dashboards() -> Vec<Dashboard> {
                 },
                 Panel {
                     id: "upstream_latency",
-                    title: "Upstream latency, ms (last 30 days at most)",
+                    title: "Upstream latency, ms (last 7 days at most)",
                     kind: "timeseries",
                     sql: UPSTREAM_LATENCY,
                     layout: at(0, 12, 12, 8),
@@ -751,14 +751,16 @@ FROM (
     ")"
 );
 
-// Of the answers not made locally, the share served from the cache. Raw rows only.
+// Of the answers not made locally, the share served from the cache.
 const CACHE_HIT_RATE: &str = "\
+-- Raw rows only, so at most the last 7 days of the range: a month of raw rows is too
+-- slow to scan while DNS is busy.
 SELECT
   round(100.0 * sum(served_from IN ('cache', 'stale_cache'))
         / nullif(sum(served_from IN ('cache', 'stale_cache', 'upstream', 'fallback')), 0),
         1) AS cache_hit_pct
 FROM queries
-WHERE ts >= :from AND ts < :to
+WHERE ts >= max(:from, :to - 604800000) AND ts < :to
   AND (:client IS NULL OR client = :client)";
 
 // Not tied to the time range or a device: the counter runs since the log was created.
@@ -768,6 +770,8 @@ FROM counters
 WHERE name = 'log_dropped'";
 
 const UPSTREAM_LATENCY: &str = "\
+-- Raw rows only, so at most the last 7 days of the range: a month of raw rows is too
+-- slow to scan while DNS is busy.
 SELECT
   CASE
     WHEN :to - :from <= 86400000 THEN ts - ts % 300000
@@ -776,7 +780,7 @@ SELECT
   END AS ts,
   round(avg(latency_ms), 1) AS avg_ms
 FROM queries
-WHERE ts >= :from AND ts < :to
+WHERE ts >= max(:from, :to - 604800000) AND ts < :to
   AND served_from IN ('upstream', 'fallback')
   AND (:client IS NULL OR client = :client)
 GROUP BY 1
