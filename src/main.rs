@@ -1,3 +1,4 @@
+mod clients;
 mod codes;
 mod config;
 mod dns;
@@ -160,6 +161,11 @@ async fn serve_dns(config: &config::Config, log: Arc<dyn LogSink>) -> Result<()>
     let listeners = Listeners::bind(config.dns.listen).await?;
     info!(addr = %listeners.local_addr()?, "dns listening on udp and tcp");
     tokio::spawn(refresh_loop(lists));
+    // Names are resolved off the query path: config names now, router PTR in the background.
+    if let Err(e) = clients::apply_config_names(&config.store.path, &config.devices) {
+        warn!("device names from config not applied: {e:#}");
+    }
+    tokio::spawn(clients::Devices::new(config.store.path.clone(), config.dns.router).run());
     tokio::select! {
         () = server::run(pipeline, listeners, log) => Ok(()),
         stop = shutdown_signal() => {

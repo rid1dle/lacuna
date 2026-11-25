@@ -21,7 +21,6 @@ pub struct Config {
     pub rewrites: Vec<Rewrite>,
     /// Friendly names for client IPs, shown in the query log.
     #[serde(default)]
-    #[allow(dead_code)] // Read by Task 10's device names.
     pub devices: BTreeMap<IpAddr, String>,
     pub api: ApiConfig,
     pub store: StoreConfig,
@@ -36,8 +35,7 @@ pub struct DnsConfig {
     pub refused_names: Vec<String>,
     pub blocked_ttl: u32,
     pub max_inflight: usize,
-    /// The router's address, used for local PTR answers.
-    #[allow(dead_code)] // Read by Task 10's device names.
+    /// The router's address, asked for the PTR names of LAN clients.
     pub router: IpAddr,
 }
 

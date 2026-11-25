@@ -39,11 +39,13 @@ CREATE TABLE rule_texts (
 );
 
 -- Every client the writer has seen. name and origin ('config' or 'ptr') stay NULL
--- until a name is known.
+-- until a name is known. named_at (unix ms) is when a PTR lookup last ran, found or not,
+-- so a client with no name is asked again only after a day.
 CREATE TABLE client_names (
     ip         TEXT PRIMARY KEY,
     name       TEXT,
     origin     TEXT,
+    named_at   INTEGER,
     first_seen INTEGER NOT NULL,
     last_seen  INTEGER NOT NULL
 );
