@@ -3,7 +3,7 @@
 # Two stages, one file out:
 #   build  compile lacuna against musl (SQLite is compiled in; DoH trusts the bundled
 #          Mozilla roots, so no certificate store is needed at runtime)
-#   final  `scratch`: no OS, no shell -- only /lacuna
+#   final  `scratch`: no OS, no shell, only /lacuna
 #
 # Build context is lacuna/ (see compose.yml).
 

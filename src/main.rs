@@ -129,8 +129,8 @@ fn parse_compare(args: &[&str]) -> Result<Compare, String> {
     })
 }
 
-/// Prints one line per difference, then the totals. Exit 1 only when it cannot run
-/// (unreadable names file); differences are the report, not a failure.
+/// Prints one line per difference, then the totals. Exit 1 when it cannot run
+/// (unreadable names file) or any query errored; differences are not a failure.
 fn run_compare(c: &Compare) -> ExitCode {
     let text = match std::fs::read_to_string(&c.names) {
         Ok(t) => t,
@@ -152,7 +152,17 @@ fn run_compare(c: &Compare) -> ExitCode {
         "{{ same: {}, differ_outcome: {}, differ_answers: {}, errors: {} }}",
         t.same, t.differ_outcome, t.differ_answers, t.errors
     );
-    ExitCode::SUCCESS
+    if compare_trustworthy(&t) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// A run with errors (a server that did not answer) says nothing about the names it
+/// missed, so it fails. Differences alone are the report and keep exit 0.
+fn compare_trustworthy(t: &compare::Totals) -> bool {
+    t.errors == 0
 }
 
 /// `import-adguard <file|-> [--db path] [--now-ms n] [--force]`. `-` reads stdin, so
@@ -589,6 +599,18 @@ mod tests {
         // A big answer comes back truncated over UDP and is fetched again over TCP.
         let ask = parse_ask(&["big.example", "--server", &server]).unwrap();
         assert_eq!(exchange(&ask).await.unwrap().answers.len(), 40);
+    }
+
+    #[test]
+    fn compare_fails_on_errors_only() {
+        let t = |differ_outcome, errors| compare::Totals {
+            same: 1,
+            differ_outcome,
+            differ_answers: 1,
+            errors,
+        };
+        assert!(compare_trustworthy(&t(3, 0)));
+        assert!(!compare_trustworthy(&t(0, 1)));
     }
 
     #[test]

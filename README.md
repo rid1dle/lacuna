@@ -50,9 +50,10 @@ nothing in the house depends on it yet.
 1. Create the network (once): `scripts/provision/networks.sh`. It adds
    `lacuna-api` (192.168.208.0/20, internal) next to the others.
 2. Create the data folder, owned by the container user. **It must not exist with
-   an older database in it**: a database made by an earlier development build has
-   a different `query_log` schema, and lacuna refuses or misreads it. If
-   `/srv/appdata/lacuna/lacuna.db` exists from a smoke test, delete it first.
+   an older database in it**: the schema changed during development without a
+   version bump, so a smoke-test database keeps the old column definitions. If one
+   exists, delete `lacuna.db`, `lacuna.db-wal` and `lacuna.db-shm` from
+   `/srv/appdata/lacuna/` first.
    ```bash
    sudo install -d -o 3070 -g 3070 -m 0750 /srv/appdata/lacuna
    ```
@@ -63,14 +64,17 @@ nothing in the house depends on it yet.
    openssl rand -hex 32 > deploy/secrets/lacuna_api
    sudo chgrp 3070 deploy/secrets/lacuna_api && chmod 0640 deploy/secrets/lacuna_api
    ```
-   Without it every API request gets 503 `{"error":"api secret not configured"}`,
-   and DNS still works.
-4. Validate and start:
+   Compose will not start the container without `deploy/secrets/lacuna_api`. An
+   empty file starts fine: every API request then gets 503
+   `{"error":"api secret not configured"}` and DNS still works. Sonder reads the
+   same value (wired in Sonder's own plan).
+4. Build, validate, start (the image must exist before `check-config` can run it):
    ```bash
-   docker run --rm -v "$PWD/deploy/config.toml:/c.toml:ro" --entrypoint /lacuna \
+   cd deploy && docker compose build
+   docker run --rm -v "$PWD/config.toml:/c.toml:ro" --entrypoint /lacuna \
      homelab/lacuna:latest check-config /c.toml
-   cd deploy && docker compose up -d --build
-   docker compose ps          # healthy after about 10 s
+   docker compose up -d
+   docker compose ps          # "healthy" within about 15 s
    ```
 5. Try it:
    ```bash
@@ -87,30 +91,52 @@ nothing in the house depends on it yet.
    ```
    Re-running skips what is already imported; `--force` forgets the previous
    import first.
-7. Compare against AdGuard on real names. Take them from the imported log or any
-   list, one per line:
+7. Compare against AdGuard on real names, one per line. Do this after step 6:
+   compare's queries land in AdGuard's log, and an import run afterwards would
+   bring them in as if you had made them.
    ```bash
    docker run --rm --network host -v "$PWD/names.txt:/names.txt:ro" \
      --entrypoint /lacuna homelab/lacuna:latest \
      compare --a 127.0.0.1:5300 --b 192.168.0.107:53 --names /names.txt --limit 500
    ```
-   Read `differ_outcome` first. Investigate each line before cutover.
+   `errors` must be 0 (the command exits 1 otherwise), or the rest says nothing
+   about the names that failed. Then read `differ_outcome`; investigate each line
+   before cutover.
 
 ## Cutover (your step)
 
 Not automated. When the comparison is clean and memory is under AdGuard's:
 
-1. Stop AdGuard: `cd services/adguard && docker compose stop`.
-2. In `deploy/compose.yml` change the two port lines from `5300` to `53`:
-   `"53:5353/udp"` and `"53:5353/tcp"`.
-3. `cd deploy && docker compose up -d`.
-4. Check from another machine: `dig @192.168.0.107 home.riddlelab.dev`.
+1. Prepare, with no downtime: edit `deploy/compose.yml`, changing the two port
+   lines from `5300` to `53` (`"53:5353/udp"`, `"53:5353/tcp"`), then
+   `cd deploy && docker compose config -q` (it prints nothing when the file is valid).
+2. Swap, back to back. `&&` means lacuna is only started if AdGuard stopped:
+   ```bash
+   (cd services/adguard && docker compose stop) && (cd deploy && docker compose up -d)
+   ```
+3. Check from another LAN machine, UDP and TCP:
+   ```bash
+   dig @192.168.0.107 home.riddlelab.dev +short           # 192.168.0.107
+   dig +tcp @192.168.0.107 home.riddlelab.dev +short      # 192.168.0.107
+   dig @192.168.0.107 doubleclick.net +short              # 0.0.0.0
+   ```
+   The last one proves the lists loaded, and also that DoH and TLS work from the
+   scratch image (nothing else proves that). On the server, `docker compose ps`
+   must show `healthy`.
+4. **If `up` fails or any check fails, run Rollback now.** Do not debug while the
+   house has no DNS.
+
+Note: after cutover, queries made on the server itself reach lacuna through
+docker-proxy and show a bridge IP as the client. LAN clients keep their own IP.
 
 ## Rollback
 
-1. `cd deploy && docker compose stop`.
-2. Change the two port lines back to `5300`.
-3. Start AdGuard: `cd services/adguard && docker compose start`.
+1. Free port 53 and start AdGuard. **Starting AdGuard is what restores DNS.**
+   ```bash
+   (cd deploy && docker compose stop) && (cd ../services/adguard && docker compose start)
+   ```
+2. Afterwards, with DNS back, change the two port lines in `deploy/compose.yml`
+   back to `5300`.
 
 The data folder is kept, so lacuna can come back later with its history.
 

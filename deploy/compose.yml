@@ -44,9 +44,10 @@ services:
     healthcheck:
       test: ["CMD", "/lacuna", "ask", "home.riddlelab.dev", "A", "--server", "127.0.0.1:5353", "--expect", "192.168.0.107"]
       interval: 30s
-      timeout: 5s
+      timeout: 8s
       retries: 3
       start_period: 10s
+      start_interval: 2s
 
 secrets:
   lacuna_api:
