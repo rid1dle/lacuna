@@ -140,6 +140,10 @@ impl Config {
                 d.url
             );
         }
+        ensure!(
+            self.api.query_timeout_ms > 0,
+            "api.query_timeout_ms must be above 0"
+        );
         ensure!(self.api.row_cap > 0, "api.row_cap must be above 0");
         ensure!(
             self.api.max_concurrent > 0,
@@ -215,6 +219,14 @@ mod tests {
             "https://9.9.9.10/dns-query",
         );
         assert!(Config::parse(&literal).is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_query_timeout() {
+        let text = DEPLOY.replace("query_timeout_ms = 5000", "query_timeout_ms = 0");
+        assert_ne!(text, DEPLOY, "fixture text moved");
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("query_timeout_ms"), "{err}");
     }
 
     #[test]
