@@ -41,6 +41,7 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::limits::Limit;
 use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Batch, Connection, ErrorCode, OpenFlags, Rows, Statement, ToSql};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// SQLite calls the progress handler at the first loop jump after every this many VM
@@ -91,8 +92,13 @@ pub struct QueryLimits {
     pub row_cap: usize,
 }
 
-/// A value for a `:name` parameter.
-#[derive(Debug, Clone, PartialEq)]
+/// A value for a `:name` parameter. In JSON: an integer, a string or null.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    untagged,
+    rename_all = "camelCase",
+    expecting = "an integer, text or null"
+)]
 pub enum ParamValue {
     Int(i64),
     Text(String),
@@ -109,7 +115,8 @@ impl ToSql for ParamValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Column {
     pub name: String,
     /// "integer", "real", "text" or "null": the type of the first non-null value in the
@@ -118,8 +125,10 @@ pub struct Column {
     pub r#type: String,
 }
 
-/// A query result, row by row in column order.
-#[derive(Debug, Clone, PartialEq)]
+/// A query result, row by row in column order. The API streams it out by hand (see
+/// `api::stream_frame`) in exactly this derive's shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Frame {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<Value>>,

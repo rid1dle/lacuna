@@ -5,7 +5,12 @@ edition = "2021"
 
 [dependencies]
 anyhow = { version = "=1.0.105", default-features = false, features = ["std"] }
+# The integration API. HTTP/1.1 only (Sonder is the one client, on a private network).
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
 hickory-proto = { version = "=0.26.4", default-features = false, features = ["std"] }
+# The `Body` trait, to stream a query result out as it is written (already in the tree
+# through hyper).
+http-body = { version = "=1.1.0", default-features = false }
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
 # TLS: reqwest's `rustls-no-provider` leaves the crypto provider to us. We compile only
@@ -26,3 +31,5 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 
 [dev-dependencies]
 tokio = { version = "=1.54.1", default-features = false, features = ["test-util"] }
+# `ServiceExt::oneshot` drives the API router in tests without a socket.
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }

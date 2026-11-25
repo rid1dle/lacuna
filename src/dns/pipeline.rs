@@ -80,7 +80,7 @@ pub fn shared<T>(value: T) -> Shared<T> {
     Arc::new(RwLock::new(Arc::new(value)))
 }
 
-fn current<T>(shared: &RwLock<Arc<T>>) -> Arc<T> {
+pub fn current<T>(shared: &RwLock<Arc<T>>) -> Arc<T> {
     // A writer only ever replaces the whole `Arc`, so a poisoned lock still holds a whole value.
     Arc::clone(&shared.read().unwrap_or_else(PoisonError::into_inner))
 }
@@ -233,14 +233,16 @@ impl<U: Upstream + 'static> Pipeline<U> {
     }
 
     /// Skip filtering rules for `duration`. Rewrites and refusals still apply.
-    #[allow(dead_code)] // Called by Task 12's pause action; tested here.
     pub fn pause(&self, duration: Duration) {
         *lock(&self.paused_until) = Some(now() + duration);
     }
 
-    #[allow(dead_code)] // Called by Task 12's resume action; tested here.
     pub fn resume(&self) {
         *lock(&self.paused_until) = None;
+    }
+
+    pub fn is_paused_now(&self) -> bool {
+        self.is_paused(now())
     }
 
     fn is_paused(&self, at: Instant) -> bool {

@@ -21,6 +21,7 @@ use tokio::runtime::Builder;
 use tracing::{error, info, warn};
 use tracing_subscriber::filter::LevelFilter;
 
+use api::readonly::QueryLimits;
 use dns::pipeline::{self, LiveConfig, LogSink, NoopSink, Pipeline};
 use dns::server::{self, Listeners};
 use dns::upstream::{Remote, UdpUpstream, Upstream, Upstreams};
@@ -87,16 +88,19 @@ fn serve(path: &Path) -> ExitCode {
     }
 }
 
-/// Starts the query log, serves DNS until a shutdown signal, then lets the log writer
-/// finish its last batch.
+/// Starts the query log, serves DNS and the API until a shutdown signal, then lets the
+/// log writer finish its last batch.
 fn serve_with_log(path: &Path) -> Result<()> {
     let config = config::Config::load(path)?;
-    let (log, writer) = start_log(open_store(&config.store));
+    let opened = open_store(&config.store);
+    // The API tells dashboards why there is no log, rather than showing empty panels.
+    let store = opened.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
+    let (log, writer) = start_log(opened);
     let rt = Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the tokio runtime")?;
-    let result = rt.block_on(serve_dns(&config, Arc::clone(&log)));
+    let result = rt.block_on(serve_dns(&config, path, Arc::clone(&log), store));
     // Shutting the runtime down drops the tasks' clones of the sink; dropping ours
     // closes the channel, and the writer writes what it holds and exits.
     rt.shutdown_timeout(TASKS_GRACE);
@@ -134,7 +138,12 @@ fn start_log(opened: Result<Store>) -> (Arc<dyn LogSink>, Option<writer::WriterH
     }
 }
 
-async fn serve_dns(config: &config::Config, log: Arc<dyn LogSink>) -> Result<()> {
+async fn serve_dns(
+    config: &config::Config,
+    config_path: &Path,
+    log: Arc<dyn LogSink>,
+    store: Result<(), String>,
+) -> Result<()> {
     // User rules first so DNS never starts with an empty set, then the last good lists
     // from disk (blocking is fine: nothing is listening yet).
     let (user_only, _) = rules::RuleSet::build(&config.user_rules, &[]);
@@ -153,15 +162,44 @@ async fn serve_dns(config: &config::Config, log: Arc<dyn LogSink>) -> Result<()>
         error!("loading last good lists, serving user rules only: {e:#}");
     }
 
+    let live = pipeline::shared(LiveConfig::from_config(config));
     let pipeline = Arc::new(Pipeline::new(
-        rules,
-        pipeline::shared(LiveConfig::from_config(config)),
+        Arc::clone(&rules),
+        Arc::clone(&live),
         upstreams,
         config.dns.max_inflight,
     ));
     let listeners = Listeners::bind(config.dns.listen).await?;
     info!(addr = %listeners.local_addr()?, "dns listening on udp and tcp");
-    tokio::spawn(refresh_loop(lists));
+    tokio::spawn(refresh_loop(Arc::clone(&lists)));
+    let api = Arc::new(api::ApiState::new(
+        api::read_secret(&config.api.secret_file),
+        store,
+        QueryLimits {
+            timeout: Duration::from_millis(config.api.query_timeout_ms),
+            row_cap: config.api.row_cap,
+        },
+        config.api.max_concurrent,
+        api::Runtime {
+            config_path: config_path.to_path_buf(),
+            db_path: config.store.path.clone(),
+            pipeline: Arc::clone(&pipeline),
+            lists,
+            rules,
+            live,
+        },
+    ));
+    // DNS never depends on the API: a port that cannot be bound is logged, not fatal.
+    match tokio::net::TcpListener::bind(config.api.listen).await {
+        Ok(listener) => {
+            info!(addr = %config.api.listen, "api listening");
+            tokio::spawn(api::serve(listener, api));
+        }
+        Err(e) => error!(
+            "api not started, serving DNS without it: {}: {e}",
+            config.api.listen
+        ),
+    }
     // Names are resolved off the query path: config names now, router PTR in the background.
     if let Err(e) = clients::apply_config_names(&config.store.path, &config.devices) {
         warn!("device names from config not applied: {e:#}");

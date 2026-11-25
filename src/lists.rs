@@ -216,10 +216,11 @@ pub struct Lists<F: Fetch> {
     db: PathBuf,
     rules: Shared<RuleSet>,
     fetcher: F,
-    /// One refresh at a time (the daily loop and a manual refresh may overlap).
+    /// One refresh at a time (the daily loop and a manual refresh may overlap), and no
+    /// config change or rebuild from disk during one.
     refresh_lock: tokio::sync::Mutex<()>,
-    /// Stats of the build behind the live set; None until one succeeds and after
-    /// `set_config`, which makes the next refresh rebuild.
+    /// Stats of the build behind the live set; None until one succeeds, which makes the
+    /// next refresh rebuild.
     built: Mutex<Option<Vec<ListStats>>>,
 }
 
@@ -243,12 +244,33 @@ impl<F: Fetch> Lists<F> {
         }
     }
 
-    /// Replaces the list configs and user rules (a config reload). Takes effect at the
-    /// next `sync_meta` / `refresh`, which rebuilds the set.
-    pub fn set_config(&self, lists: Vec<ListConfig>, user_rules: Vec<String>) {
+    /// Replaces the list configs and user rules (a config reload) and applies them at
+    /// once: `list_meta` rows, then a rebuild from the bodies on disk. Waits for a
+    /// refresh in flight, which would otherwise finish with the old config after this
+    /// returns: saving a body fetched from a URL the reload moved away from, and swapping
+    /// in a set built from the old user rules.
+    pub async fn set_config(&self, lists: Vec<ListConfig>, user_rules: Vec<String>) -> Result<()> {
+        let _one_at_a_time = self.refresh_lock.lock().await;
         *self.conf.write().unwrap_or_else(PoisonError::into_inner) =
             Arc::new(Conf { lists, user_rules });
+        // A failed rebuild leaves this None, so the next refresh rebuilds.
         *self.built.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.sync_meta().await;
+        let (set, stats) = self.rebuild().await?;
+        self.swap(set, stats);
+        Ok(())
+    }
+
+    /// The configured name of list `id`; list 0 is the user rules.
+    pub fn list_name(&self, id: u32) -> Option<String> {
+        if id == 0 {
+            return Some("user rules".to_string());
+        }
+        let conf = self.conf();
+        conf.lists
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| l.name.clone())
     }
 
     fn conf(&self) -> Arc<Conf> {
@@ -299,6 +321,7 @@ impl<F: Fetch> Lists<F> {
 
     /// Builds the rule set from the bodies on disk. No network.
     pub async fn load_last_good(&self) -> Result<()> {
+        let _one_at_a_time = self.refresh_lock.lock().await;
         let (set, stats) = self.rebuild().await?;
         info!(
             rules = set.rule_count(),
@@ -619,18 +642,43 @@ mod tests {
 
     /// A fetcher serving canned bodies by URL, changeable between refreshes.
     #[derive(Clone, Default)]
-    struct FakeFetch(Arc<Mutex<HashMap<String, Result<String, String>>>>);
+    struct FakeFetch {
+        bodies: Arc<Mutex<HashMap<String, Result<String, String>>>>,
+        /// Once set, every fetch signals `entered` and waits for a `release` permit.
+        gate: Arc<Mutex<Option<Gate>>>,
+    }
+
+    #[derive(Clone)]
+    struct Gate {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
 
     impl FakeFetch {
         fn set(&self, url: &str, body: Result<&str, &str>) {
             let body = body.map(String::from).map_err(String::from);
-            self.0.lock().unwrap().insert(url.to_string(), body);
+            self.bodies.lock().unwrap().insert(url.to_string(), body);
+        }
+
+        fn gate(&self) -> Gate {
+            let gate = Gate {
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+            };
+            *self.gate.lock().unwrap() = Some(gate.clone());
+            gate
         }
     }
 
     impl Fetch for FakeFetch {
         async fn fetch(&self, url: &str) -> Result<String, String> {
-            let found = self.0.lock().unwrap().get(url).cloned();
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(g) = gate {
+                // notify_one stores the signal if nobody is waiting yet.
+                g.entered.notify_one();
+                g.release.acquire().await.unwrap().forget();
+            }
+            let found = self.bodies.lock().unwrap().get(url).cloned();
             found.unwrap_or_else(|| Err("not served".into()))
         }
     }
@@ -890,11 +938,13 @@ mod tests {
             Some(URL2.to_string())
         );
         // A renamed list is updated, not duplicated.
-        r.lists.set_config(
-            vec![cfg(1, "Renamed", URL1, true), cfg(2, "Second", URL2, false)],
-            vec![],
-        );
-        r.lists.sync_meta().await;
+        r.lists
+            .set_config(
+                vec![cfg(1, "Renamed", URL1, true), cfg(2, "Second", URL2, false)],
+                vec![],
+            )
+            .await
+            .unwrap();
         assert_eq!(r.sql::<i64>("SELECT count(*) FROM list_meta"), Some(2));
         assert_eq!(
             r.sql::<String>("SELECT name FROM list_meta WHERE id = 1"),
@@ -910,12 +960,18 @@ mod tests {
         assert!(r.dir.join("1.txt").exists());
 
         // List 2 leaves the config; list 1 now comes from another URL.
-        r.lists.set_config(
-            vec![cfg(1, "First", "https://other.test/1.txt", true)],
-            vec![],
-        );
-        r.lists.sync_meta().await;
+        r.lists
+            .set_config(
+                vec![cfg(1, "First", "https://other.test/1.txt", true)],
+                vec![],
+            )
+            .await
+            .unwrap();
         assert!(!r.dir.join("1.txt").exists());
+        assert!(
+            !r.blocks("adnet.com"),
+            "the moved list's old body left the set"
+        );
         assert_eq!(
             r.sql::<i64>("SELECT enabled FROM list_meta WHERE id = 2"),
             Some(0)
@@ -926,18 +982,61 @@ mod tests {
         );
     }
 
+    /// A reload while a refresh is fetching list 1 from the URL the reload moves it away
+    /// from. The reload must wait: otherwise it removes the old file first, and the
+    /// refresh then saves the old URL's body and swaps it in after the reload.
     #[tokio::test]
-    async fn config_change_forces_a_rebuild_even_when_bodies_match() {
+    async fn set_config_waits_for_an_in_flight_refresh() {
+        let r = Arc::new(rig("race"));
+        r.fetch.set(URL1, Ok("||old-url.test^\n"));
+        let gate = r.fetch.gate();
+        let refresh = tokio::spawn({
+            let r = Arc::clone(&r);
+            async move { r.lists.refresh().await }
+        });
+        gate.entered.notified().await;
+
+        let reload = tokio::spawn({
+            let r = Arc::clone(&r);
+            async move {
+                r.lists
+                    .set_config(
+                        vec![cfg(1, "First", "https://other.test/1.txt", true)],
+                        vec![],
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!reload.is_finished(), "the reload ran during the refresh");
+
+        gate.release.add_permits(1);
+        refresh.await.unwrap();
+        reload.await.unwrap();
+        assert!(!r.blocks("old-url.test"));
+        assert!(!r.dir.join("1.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn config_change_applies_at_once_without_a_fetch() {
         let r = rig("reload");
         r.fetch.set(URL1, Ok("||adnet.com^\n"));
         r.lists.refresh().await;
-        r.lists.set_config(
-            vec![cfg(1, "First", URL1, true)],
-            vec!["||new-user.test^".to_string()],
-        );
-        let report = r.lists.refresh().await;
-        assert!(report.swapped);
+        // Unreachable now: the rebuild must come from the body on disk.
+        r.fetch.set(URL1, Err("offline"));
+        r.lists
+            .set_config(
+                vec![cfg(1, "First", URL1, true)],
+                vec!["||new-user.test^".to_string()],
+            )
+            .await
+            .unwrap();
         assert!(r.blocks("new-user.test") && !r.blocks("user-blocked.test"));
+        assert!(r.blocks("adnet.com"));
+        assert_eq!(r.lists.list_name(1).as_deref(), Some("First"));
+        assert_eq!(r.lists.list_name(0).as_deref(), Some("user rules"));
+        assert_eq!(r.lists.list_name(9), None);
     }
 
     #[tokio::test]

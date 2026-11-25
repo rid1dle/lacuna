@@ -77,7 +77,6 @@ pub struct Rewrite {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // Read by Tasks 11 and 12 (query executor, API).
 pub struct ApiConfig {
     pub listen: SocketAddr,
     pub secret_file: PathBuf,
