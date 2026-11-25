@@ -35,7 +35,8 @@ use crate::rules::{parse_line, ListStats, Parsed, RuleIds, RuleSet};
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// A list bigger than this is refused: the largest real list is a few MB.
 const MAX_BODY_BYTES: usize = 20 * 1024 * 1024;
-/// Rule texts per transaction while saving a changed list.
+/// Rule texts per transaction, while saving a changed list and while a build
+/// interns its texts (short transactions keep the live log writer moving).
 const RULE_CHUNK: usize = 5_000;
 /// First refresh after startup, then once a day.
 pub const FIRST_REFRESH: Duration = Duration::from_secs(5);

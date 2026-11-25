@@ -1,9 +1,9 @@
 # lacuna
 
 A small ad-blocking DNS server in Rust, built to replace AdGuard Home on this
-server. One static binary in a `scratch` image (about 17 MB on disk; about 45 to
-55 MB of RAM with the AdGuard DNS filter loaded, against AdGuard's 81 MiB),
-SQLite compiled in, no database server.
+server. One static binary in a `scratch` image (about 17 MB on disk; 26 to 37 MB
+of RAM with the AdGuard DNS filter loaded, 59 MB at the daily rule rebuild,
+against AdGuard's 81 MiB), SQLite compiled in, no database server.
 
 What it does: blocks names from AdGuard-syntax filter lists, answers a few local
 names itself (`*.home.riddlelab.dev` -> 192.168.0.107), races DoH upstreams
@@ -121,7 +121,7 @@ AdGuard DNS filter (194,783 rules parsed, 22 regex rules skipped). Build: commit
 | History import | 4,464,298 AdGuard log lines: 1,716,701 kept raw (last 30 days), 2,747,597 into the hourly and daily counts only, 0 skipped. Rollups plus the raw tail equal the lines imported exactly. 68 s; slowest write batch 70 ms. |
 | Compare, 3,378 names from the last 24 h (A and AAAA) | 0 outcome differences. 932 answer differences: 928 are CDN address rotation (724 different address sets, 204 overlapping), 4 are AAAA answers empty on one side only (Stripe and CloudFront names). 2 errors: one name timed out on both servers. |
 | Before the wildcard work (build 0292946) | 64 outcome differences over 33 names, all from rule forms lacuna skipped (`*` inside a name, `\|` anchors, a leading dot). Over the imported window AdGuard blocked 328,342 queries; those forms decided 20,769 blocks lacuna would have missed (6.3%) and 1,065 allowed queries it would have blocked. |
-| Memory, process RSS | 45 MB after a fresh start; 55 MB with the DNS cache warm; 66 MB under DNS load (3 compare streams) plus 4 concurrent 30-day dashboard queries; 75 MB at the peak of a rule rebuild (list refresh or config reload), settling at 56 MB. AdGuard: 81 MiB. The 40 MB target is not met yet: moving rule text out of memory is the next change. |
+| Memory, process RSS (build c819788) | 26 MB after a fresh start; 37 MB with the DNS cache full (filled past its 4,000 cap with 5,225 real names); 46 MB under DNS load (3 compare streams) plus 4 concurrent 30-day dashboard queries; 59 MB at the peak of a rule rebuild with the cache full (list refresh or config reload), settling at 37 MB, with no swapping and no container memory-limit events. AdGuard: 81 MiB. Before rule text moved into SQLite (build b769f88) the same rebuild peaked at 100 MB, at the 96 MiB limit. |
 | Disk | `lacuna.db` 244 MB after the import (1.7M raw rows, about 77 days of rollups); filter list copies 4.6 MB. |
 | Dashboards | Every default panel answers over 1 and 30 days. Slowest at 30 days, idle: cache hit % 0.74 s, top domains per device 0.59 s, all others under 0.3 s. Cache hit % and upstream latency read raw rows and cover at most the last 7 days: before that clamp, cache hit % over 30 days took 2.4 s alone and timed out (6 of 6) with two running under load. With 4 concurrent requests and 2 query slots, 2 get `429 busy`, as the contract specifies. |
 | API | 401 without the secret, 401 with a wrong one, 200 with it, from the `lacuna-api` network. |
@@ -176,8 +176,9 @@ API from the `lacuna-api` network (see `CONTRACT.md` for the call):
   ```bash
   grep VmRSS /proc/$(docker inspect lacuna --format '{{.State.Pid}}')/status
   ```
-  It must stay under <RE-MEASURED> (the shadow run's rebuild peak); a steady
-  climb past that is a reason to roll back.
+  Normal is under 40 MB (37 MB with the cache full in the shadow run). Brief
+  peaks up to about 60 MB come from the daily rule rebuild (59 MB measured). A
+  steady climb past 60 MB is a reason to roll back.
 - Browse normally on a phone and a laptop. A site that breaks and works with
   AdGuard is a rule difference: note the name, then check it with the
   `test_domain` action.

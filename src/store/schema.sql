@@ -31,6 +31,9 @@ CREATE TABLE list_meta (
 );
 
 -- list_id 0 is the user rules from config.toml.
+-- Rows are never deleted or renumbered: the live rule set holds these ids in
+-- memory, including for rules not hit yet. Pruning would make the views name
+-- NULL (or the wrong) rule.
 CREATE TABLE rule_texts (
     id      INTEGER PRIMARY KEY,
     list_id INTEGER NOT NULL,
