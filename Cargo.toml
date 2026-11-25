@@ -7,6 +7,8 @@ edition = "2021"
 anyhow = { version = "=1.0.105", default-features = false, features = ["std"] }
 # The integration API. HTTP/1.1 only (Sonder is the one client, on a private network).
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+# Base64 for the answers in AdGuard's query log (already in the tree through hickory-proto).
+data-encoding = { version = "=2.11.1", default-features = false, features = ["alloc"] }
 hickory-proto = { version = "=0.26.4", default-features = false, features = ["std"] }
 # The `Body` trait, to stream a query result out as it is written (already in the tree
 # through hyper).

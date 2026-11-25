@@ -654,6 +654,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "lacuna"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "data-encoding",
+ "hickory-proto",
+ "http-body",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-root-certs",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1070,27 +1092,6 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "lacuna"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "hickory-proto",
- "http-body",
- "reqwest",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tower",
- "tracing",
- "tracing-subscriber",
- "webpki-root-certs",
-]
 
 [[package]]
 name = "signal-hook-registry"

@@ -21,7 +21,6 @@ const ROLLED_HOURLY: &str = "rolled_hourly_until";
 const ROLLED_DAILY: &str = "rolled_daily_until";
 
 /// Rollups, then retention. The writer thread calls the two on their own schedules.
-#[allow(dead_code)] // Task 13's history import runs both after loading rows.
 pub fn run(store: &Store, now_ms: i64) -> Result<()> {
     roll_up(store, now_ms)?;
     retain(store, now_ms)
@@ -59,7 +58,7 @@ pub(super) fn roll_late(conn: &Connection, after_rowid: i64) -> Result<u64> {
     let hourly = meta(conn, ROLLED_HOURLY)?.unwrap_or(0);
     let daily = meta(conn, ROLLED_DAILY)?.unwrap_or(0);
     let late: i64 = conn.query_row(
-        "SELECT count(*) FROM raw_queries WHERE rowid > ?1 AND ts < ?2",
+        &format!("SELECT count(*) FROM raw_queries WHERE {LATE}"),
         params![after_rowid, hourly.max(daily)],
         |r| r.get(0),
     )?;
@@ -70,10 +69,27 @@ pub(super) fn roll_late(conn: &Connection, after_rowid: i64) -> Result<u64> {
     Ok(u64::try_from(late).unwrap_or(0))
 }
 
+/// Imported history older than the raw window: rows inserted after `after_rowid` with
+/// `ts < before` are added to both rollups whatever the marks say (no scheduled rollup
+/// will ever see them), then deleted from raw_queries. Runs in the inserting
+/// transaction. Returns how many there were.
+pub(super) fn roll_and_drop_old(conn: &Connection, after_rowid: i64, before: i64) -> Result<u64> {
+    roll_hourly(conn, LATE, after_rowid, before)?;
+    roll_daily(conn, LATE, after_rowid, before)?;
+    let n = conn.execute(
+        &format!("DELETE FROM raw_queries WHERE {LATE}"),
+        params![after_rowid, before],
+    )?;
+    Ok(n as u64)
+}
+
 /// Raw rows a rollup reads: a `ts` range (the scheduled rollup, through the ts index),
 /// or rows after a rowid that are behind a mark (late rows).
 const IN_RANGE: &str = "ts >= ?1 AND ts < ?2";
-const LATE: &str = "rowid > ?1 AND ts < ?2";
+/// The unary `+` keeps SQLite off the ts index: the marks sit close to now, so through
+/// that index `ts < mark` would walk nearly every raw row, where the rowid range reads
+/// this batch's rows only.
+const LATE: &str = "rowid > ?1 AND +ts < ?2";
 
 /// Upserts, so counts already in the rollups (late rows, the AdGuard import) add up.
 fn roll_hourly(conn: &Connection, rows: &str, a: i64, b: i64) -> Result<()> {
@@ -154,13 +170,13 @@ fn delete_chunked(conn: &Connection, sql: &str, cutoff: i64) -> Result<()> {
     Ok(())
 }
 
-fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
+pub(super) fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
         .optional()?)
 }
 
-fn set_meta(conn: &Connection, key: &str, value: i64) -> Result<()> {
+pub(super) fn set_meta(conn: &Connection, key: &str, value: i64) -> Result<()> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -353,6 +369,30 @@ mod tests {
             "only the row in the open IST day is kept"
         );
         assert_eq!(totals(store), vec![vec![5, 4, 3]]);
+    }
+
+    /// Late rows are found by rowid, so only this batch's rows are read. Left to the ts
+    /// index, `ts < mark` would walk nearly every raw row on every batch, because the
+    /// marks sit close to now.
+    #[test]
+    fn late_rows_are_found_by_rowid() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        for sql in [
+            format!("SELECT count(*) FROM raw_queries WHERE {LATE}"),
+            format!("DELETE FROM raw_queries WHERE {LATE}"),
+        ] {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let steps: Vec<String> = stmt
+                .query_map(params![1, 2], |r| r.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let steps = steps.join(" | ");
+            assert!(steps.contains("INTEGER PRIMARY KEY"), "{sql}: {steps}");
+        }
     }
 
     #[test]

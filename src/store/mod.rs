@@ -31,6 +31,10 @@ pub const DAY_MS: i64 = 86_400_000;
 /// Asia/Kolkata is UTC+05:30 all year (no DST), so a house day is a fixed offset from UTC.
 pub const IST_OFFSET_MS: i64 = 19_800_000;
 
+/// meta key set (unix ms) when an AdGuard history import starts. A second import would
+/// count the same queries twice, so it is refused while this is set.
+const ADGUARD_IMPORTED_AT: &str = "adguard_imported_at";
+
 /// The list id of the user rules from config.toml.
 const USER_LIST_ID: u32 = 0;
 
@@ -114,6 +118,31 @@ impl Store {
             conn,
             retention: Retention::default(),
         })
+    }
+
+    /// Records that an AdGuard import starts now, unless one already started: then
+    /// returns when it did and changes nothing. One IMMEDIATE transaction, so two
+    /// imports cannot both claim the database.
+    pub fn claim_adguard_import(&self, now_ms: i64) -> Result<Option<i64>> {
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(at) = rollup::meta(&tx, ADGUARD_IMPORTED_AT)? {
+            return Ok(Some(at));
+        }
+        rollup::set_meta(&tx, ADGUARD_IMPORTED_AT, now_ms)?;
+        tx.commit()?;
+        Ok(None)
+    }
+
+    /// Clears the import mark, for `import-adguard --force`.
+    pub fn forget_adguard_import(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", [ADGUARD_IMPORTED_AT])?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
     }
 }
 

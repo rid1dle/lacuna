@@ -3,12 +3,15 @@ mod clients;
 mod codes;
 mod config;
 mod dns;
+mod import;
 mod lists;
 mod rules;
 mod store;
 
+use std::fs::File;
+use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -29,11 +32,14 @@ use lists::{HttpFetcher, Lists};
 use store::{writer, Retention, Store};
 
 const USAGE: &str = "usage: lacuna <check-config <path> | serve <path> | \
-                     ask <name> [type] [--server addr] [--expect ip]>";
+                     ask <name> [type] [--server addr] [--expect ip] | \
+                     import-adguard <file|-> [--db path] [--now-ms n] [--force]>";
 
 /// `ask` waits this long for an answer, UDP plus a TCP retry.
 const ASK_TIMEOUT: Duration = Duration::from_secs(2);
 const ASK_SERVER: &str = "127.0.0.1:5353";
+/// The database `import-adguard` writes to without `--db`: the deploy config's path.
+const IMPORT_DB: &str = "/data/lacuna.db";
 /// At shutdown: how long tokio tasks get to finish, then how long the log writer gets
 /// to write what it holds. Both bounded so `docker stop` never hangs on them.
 const TASKS_GRACE: Duration = Duration::from_secs(1);
@@ -63,10 +69,86 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        ["import-adguard", rest @ ..] => match parse_import(rest) {
+            Ok(i) => import_adguard(&i),
+            Err(e) => {
+                eprintln!("{e}\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// `import-adguard <file|-> [--db path] [--now-ms n] [--force]`. `-` reads stdin, so
+/// the log can be piped out of AdGuard's container without a copy.
+#[derive(Debug, PartialEq)]
+struct Import {
+    input: String,
+    db: PathBuf,
+    now_ms: Option<i64>,
+    force: bool,
+}
+
+fn parse_import(args: &[&str]) -> Result<Import, String> {
+    let mut input = None;
+    let mut db = IMPORT_DB;
+    let mut now_ms = None;
+    let mut force = false;
+    let mut it = args.iter();
+    while let Some(&arg) = it.next() {
+        match arg {
+            "--db" => db = it.next().ok_or("--db needs a path")?,
+            "--now-ms" => {
+                let n = it.next().ok_or("--now-ms needs a number")?;
+                now_ms = Some(n.parse().map_err(|_| format!("bad --now-ms {n}"))?);
+            }
+            "--force" => force = true,
+            flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
+            word if input.is_none() => input = Some(word),
+            _ => return Err("import-adguard takes one file".into()),
+        }
+    }
+    Ok(Import {
+        input: input
+            .ok_or("import-adguard needs a file, or - for stdin")?
+            .to_string(),
+        db: PathBuf::from(db),
+        now_ms,
+        force,
+    })
+}
+
+/// Prints the report on success; exit 1 on any error.
+fn import_adguard(i: &Import) -> ExitCode {
+    match run_import(i) {
+        Ok(report) => {
+            println!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_import(i: &Import) -> Result<import::ImportReport> {
+    let store = Store::open(&i.db)?;
+    if i.force {
+        store.forget_adguard_import()?;
+    }
+    let now = i.now_ms.unwrap_or_else(writer::now_ms);
+    // The default retention is the deploy config's.
+    let raw_days = store.retention.raw_days;
+    if i.input == "-" {
+        import::import_adguard(std::io::stdin().lock(), &store, now, raw_days)
+    } else {
+        let file = File::open(&i.input).with_context(|| format!("opening {}", i.input))?;
+        import::import_adguard(BufReader::new(file), &store, now, raw_days)
     }
 }
 
@@ -423,6 +505,37 @@ mod tests {
         // A big answer comes back truncated over UDP and is fetched again over TCP.
         let ask = parse_ask(&["big.example", "--server", &server]).unwrap();
         assert_eq!(exchange(&ask).await.unwrap().answers.len(), 40);
+    }
+
+    #[test]
+    fn import_defaults_and_flags() {
+        assert_eq!(
+            parse_import(&["-"]).unwrap(),
+            Import {
+                input: "-".into(),
+                db: PathBuf::from(IMPORT_DB),
+                now_ms: None,
+                force: false,
+            }
+        );
+        assert_eq!(
+            parse_import(&["--force", "q.json", "--db", "/tmp/x.db", "--now-ms", "17"]).unwrap(),
+            Import {
+                input: "q.json".into(),
+                db: PathBuf::from("/tmp/x.db"),
+                now_ms: Some(17),
+                force: true,
+            }
+        );
+        for bad in [
+            &[][..],
+            &["a.json", "b.json"],
+            &["a.json", "--db"],
+            &["a.json", "--now-ms", "soon"],
+            &["a.json", "--quiet"],
+        ] {
+            assert!(parse_import(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[tokio::test]

@@ -207,6 +207,44 @@ fn add_counter(tx: &Transaction, name: &str, by: u64) -> Result<()> {
 /// as seen. Rows behind the rollup marks are added to the rollups here, so they count
 /// exactly once; returns how many there were. Counters are the caller's business.
 pub fn insert_batch(tx: &Transaction, records: &[QueryRecord], source: Source) -> Result<u64> {
+    let before = insert_rows(tx, records, source)?;
+    rollup::roll_late(tx, before)
+}
+
+/// What one imported batch did.
+pub struct ImportedBatch {
+    pub raw: u64,
+    pub rolled_up_only: u64,
+    /// From taking the write lock to committing: how long the live writer could wait.
+    pub held: Duration,
+}
+
+/// Writes one batch of imported history in one transaction. Rows from `raw_from_ms` on
+/// stay raw, and those behind the rollup marks are rolled up here as live late rows are,
+/// but not added to `log_late`: they are history, not a writer falling behind. Older
+/// rows only add to the rollups.
+pub fn import_batch(
+    store: &Store,
+    records: &[QueryRecord],
+    raw_from_ms: i64,
+) -> Result<ImportedBatch> {
+    // IMMEDIATE (the connection's default): waits, up to busy_timeout, while the live
+    // writer holds the lock, instead of failing.
+    let tx = store.conn.unchecked_transaction()?;
+    let locked = Instant::now();
+    let before = insert_rows(&tx, records, Source::Adguard)?;
+    let rolled_up_only = rollup::roll_and_drop_old(&tx, before, raw_from_ms)?;
+    rollup::roll_late(&tx, before)?;
+    tx.commit()?;
+    Ok(ImportedBatch {
+        raw: records.len() as u64 - rolled_up_only,
+        rolled_up_only,
+        held: locked.elapsed(),
+    })
+}
+
+/// Inserts the rows and returns the largest rowid before them.
+fn insert_rows(tx: &Connection, records: &[QueryRecord], source: Source) -> Result<i64> {
     // New rows get rowids above the current maximum, which is how the late rollup
     // finds this batch's rows.
     let before: i64 = tx.query_row("SELECT coalesce(max(rowid), 0) FROM raw_queries", [], |r| {
@@ -290,10 +328,10 @@ pub fn insert_batch(tx: &Transaction, records: &[QueryRecord], source: Source) -
     for (ip, (first, last)) in clients {
         put_client.execute(params![ip.to_string(), first, last])?;
     }
-    rollup::roll_late(tx, before)
+    Ok(before)
 }
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
