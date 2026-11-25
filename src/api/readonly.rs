@@ -1,16 +1,30 @@
 //! Runs one user-written SQL query against the query log, read-only.
 //!
-//! The SQL comes from Sonder's dashboards, so it is treated as hostile. Every layer below
-//! would stop a write on its own; they are stacked so that one SQLite surprise is not a
-//! hole:
+//! The SQL comes from Sonder's dashboards, so it is treated as hostile. The layers
+//! overlap, so most refusals have more than one cause, but no single layer is enough:
+//! VACUUM INTO, for one, gets past the read-only open, `query_only` and the authorizer's
+//! compile-time check, and is stopped only by SQLite's `readonly` verdict and by the
+//! authorizer refusing the ATTACH it runs internally.
 //! * the file is opened read-only, and `query_only` refuses writes on top of that;
-//! * an authorizer, consulted while SQLite compiles the statement, allows only reading
-//!   (SELECT, column reads, functions, recursive CTEs) and refuses every other action:
-//!   writes, PRAGMA, ATTACH, transactions, temp objects, `load_extension`;
-//! * only one statement runs; anything but whitespace or comments after it is refused;
-//! * limits cap the SQL length, the size of any one value, and attached databases at 0;
-//! * a progress handler stops the query at its deadline, and the row cap bounds the
-//!   result.
+//! * an authorizer, consulted while SQLite compiles the statement (and for statements it
+//!   runs internally), allows only reading (SELECT, column reads, functions, recursive
+//!   CTEs) and refuses every other action: writes, PRAGMA, ATTACH, transactions, temp
+//!   objects, `load_extension`;
+//! * only one statement runs; anything but whitespace or comments after it is refused,
+//!   and SQLite must judge that statement read-only;
+//! * limits cap the SQL length, the size of any one value, the columns in a row, and
+//!   attached databases at 0; a budget caps the bytes of the whole result;
+//! * a deadline, and the row cap.
+//!
+//! The deadline is approximate. SQLite consults the progress handler only at loop jumps,
+//! every `PROGRESS_STEPS` VM instructions, and one instruction can be one long function
+//! call: the worst measured is `instr` with a 64 KiB haystack and a 32 KiB needle, about
+//! 0.3 s. Each returned row is also checked against the deadline as it arrives, so rows
+//! that each make such a call stop about one call late (260 ms at a 200 ms limit). Rows
+//! that are filtered or aggregated, not returned, are checked only every few rows (about
+//! 1 s at a 200 ms limit). Calls within one row are never checked between: the late row
+//! is answered with `Timeout`, but the work already done is (calls in the row) x 0.3 s,
+//! bounded only by the SQL length.
 //!
 //! Each query gets its own connection, closed when it returns, so nothing it sets can
 //! leak into the next one, and the log writer's connection is never touched.
@@ -28,13 +42,27 @@ use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Batch, Connection, ErrorCode, OpenFlags, Rows, Statement, ToSql};
 use serde_json::Value;
 
-/// The progress handler runs every this many SQLite VM instructions (microseconds each).
-const PROGRESS_STEPS: i32 = 1000;
+/// SQLite calls the progress handler at the first loop jump after every this many VM
+/// instructions. Most instructions take nanoseconds, but a function call is one
+/// instruction however long it runs. 10 would check about every row but made a 3M-row
+/// scan 3x slower (2.9 s to 9.1 s); 100 checks every few rows.
+const PROGRESS_STEPS: i32 = 100;
 const MAX_SQL_BYTES: i32 = 100_000;
-/// The largest string or blob a query may build or read. A single `randomblob(1e9)` is
-/// one VM instruction, so the deadline cannot stop it; this limit can. Log values are
-/// short (names, addresses, small JSON), so 1 MB is far above any real one.
-const MAX_VALUE_BYTES: i32 = 1_000_000;
+/// The largest string or blob a query may build or read (SQLITE_LIMIT_LENGTH). One big
+/// value is built inside a single VM instruction, where the deadline cannot stop it, and
+/// quadratic functions (`instr`, `replace`) cost about the square of their input. Log
+/// values are short (domains at most 253 bytes, rule texts far below 64 KiB).
+const MAX_VALUE_BYTES: i32 = 64 * 1024;
+/// SQLITE_LIMIT_COLUMN (default 2000). The widest row SQLite can build is then
+/// 100 x 64 KiB = 6.4 MiB, the most one row can add on top of the result budget.
+const MAX_COLUMNS: i32 = 100;
+/// The bytes a result may hold before the query is refused, counted as the rows are
+/// read, so memory never passes this plus one row. Each value counts its in-memory slot
+/// (a `serde_json::Value`, 32 bytes, even for a number or null) plus its text: 10,000
+/// log rows of all 17 `queries` columns measured 6.6 MB. Measured peak per query at this
+/// budget, with SQLite's own copies of the widest rows: 23 MB. Two at once
+/// (api.max_concurrent) is 46 MB, beside DNS's 40 MB target in the 96 MiB container.
+const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 /// Set before the authorizer is installed, which would refuse them. cache_size is
 /// negative KiB: 2 MB. temp_store FILE sends sort and temp-table spills to SQLITE_TMPDIR
 /// on the volume, not to memory charged to the container.
@@ -100,6 +128,10 @@ pub enum QueryError {
     MultipleStatements,
     UnknownParam(String),
     Timeout,
+    /// The rows held so far passed the result budget.
+    ResultTooLarge {
+        limit_bytes: usize,
+    },
     Sql(String),
 }
 
@@ -110,6 +142,10 @@ impl fmt::Display for QueryError {
             QueryError::MultipleStatements => f.write_str("only one statement is allowed"),
             QueryError::UnknownParam(name) => write!(f, "parameter :{name} has no value"),
             QueryError::Timeout => f.write_str("query stopped at the time limit"),
+            QueryError::ResultTooLarge { limit_bytes } => write!(
+                f,
+                "result passed {limit_bytes} bytes; select fewer rows or columns"
+            ),
             QueryError::Sql(msg) => f.write_str(msg),
         }
     }
@@ -129,7 +165,8 @@ pub fn run_query(
     let denied = Arc::new(Mutex::new(None));
     let conn = open(db_path, started + limits.timeout, Arc::clone(&denied))
         .map_err(|e| classify(e, &denied))?;
-    let frame = execute(&conn, sql, params, limits.row_cap).map_err(|e| match e {
+    let deadline = started + limits.timeout;
+    let frame = execute(&conn, sql, params, limits.row_cap, deadline).map_err(|e| match e {
         Failure::Query(q) => q,
         Failure::Sqlite(e) => classify(e, &denied),
     })?;
@@ -156,6 +193,7 @@ fn open(
     conn.execute_batch(READ_PRAGMAS)?;
     conn.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, MAX_SQL_BYTES)?;
     conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)?;
+    conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, MAX_COLUMNS)?;
     conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
     conn.authorizer(Some(move |ctx: AuthContext<'_>| {
         authorize(ctx.action, &denied)
@@ -205,6 +243,7 @@ fn execute(
     sql: &str,
     params: &BTreeMap<String, ParamValue>,
     row_cap: usize,
+    deadline: Instant,
 ) -> Result<Frame, Failure> {
     let mut stmt = single_statement(conn, sql)?;
     // SQLite's own verdict, a last check behind the authorizer.
@@ -213,7 +252,7 @@ fn execute(
     }
     bind(&mut stmt, params)?;
     let columns: Vec<String> = stmt.column_names().map(String::from).collect();
-    let (rows, types, truncated) = fetch(stmt.raw_query(), columns.len(), row_cap)?;
+    let (rows, types, truncated) = fetch(stmt.raw_query(), columns.len(), row_cap, deadline)?;
     Ok(Frame {
         columns: columns
             .into_iter()
@@ -268,20 +307,40 @@ fn bind(stmt: &mut Statement<'_>, params: &BTreeMap<String, ParamValue>) -> Resu
 type Fetched = (Vec<Vec<Value>>, Vec<Option<&'static str>>, bool);
 
 /// Reads up to `row_cap` rows; one more row present means the result was truncated.
-fn fetch(mut rows: Rows<'_>, width: usize, row_cap: usize) -> rusqlite::Result<Fetched> {
+/// Refuses a result past `MAX_RESULT_BYTES`, and a row that arrives after the deadline
+/// (its work ran where the progress handler could not stop it).
+fn fetch(
+    mut rows: Rows<'_>,
+    width: usize,
+    row_cap: usize,
+    deadline: Instant,
+) -> Result<Fetched, Failure> {
     let mut out = Vec::new();
     let mut types: Vec<Option<&'static str>> = vec![None; width];
+    let mut held = 0;
     while let Some(row) = rows.next()? {
+        if Instant::now() >= deadline {
+            return Err(QueryError::Timeout.into());
+        }
         if out.len() == row_cap {
             return Ok((out, types, true));
         }
         let mut values = Vec::with_capacity(width);
+        held += std::mem::size_of::<Vec<Value>>();
         for (i, t) in types.iter_mut().enumerate() {
             let v = row.get_ref(i)?;
             if t.is_none() {
                 *t = type_name(v);
             }
-            values.push(to_json(v));
+            let v = to_json(v);
+            held += std::mem::size_of::<Value>() + v.as_str().map_or(0, str::len);
+            values.push(v);
+        }
+        if held > MAX_RESULT_BYTES {
+            return Err(QueryError::ResultTooLarge {
+                limit_bytes: MAX_RESULT_BYTES,
+            }
+            .into());
         }
         out.push(values);
     }
@@ -363,6 +422,21 @@ mod tests {
                     .unwrap();
             }
             Fixture { writer, db }
+        }
+
+        /// Adds `n` more rows like the first ones, in one transaction.
+        fn add_rows(&self, n: i64) {
+            let tx = self.writer.unchecked_transaction().unwrap();
+            for i in 0..n {
+                tx.execute(
+                    "INSERT INTO raw_queries (ts, client, domain_id, qtype, rcode, outcome,
+                         reason, served_from, latency_us, answers, source)
+                     VALUES (?1, '192.168.0.10', 1, 1, 0, 0, 0, 0, 1500, '93.184.215.14', 0)",
+                    [ROWS * 1000 + i],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
         }
 
         fn raw_rows(&self) -> i64 {
@@ -548,8 +622,7 @@ mod tests {
         // VACUUM INTO works on a read-only database and writes a file: it must not get far.
         let f = Fixture::new();
         let copy = TempDb::new("vacuum-copy");
-        let r = f.run(&format!("VACUUM INTO '{}'", copy.0.display()));
-        assert!(r.is_err(), "{r:?}");
+        f.assert_refused(&format!("VACUUM INTO '{}'", copy.0.display()));
         assert!(!copy.0.exists());
     }
 
@@ -641,14 +714,82 @@ mod tests {
 
     #[test]
     fn oversized_values_refused() {
-        // One huge value would be charged to the container's 96 MB in a single VM step,
-        // before the progress handler can stop it.
+        // One big value is built inside a single VM step, where no deadline can stop it.
         let f = Fixture::new();
-        let r = f.run("SELECT length(randomblob(2000000))");
-        assert!(matches!(r, Err(QueryError::Sql(_))), "{r:?}");
+        let r = f.run("SELECT length(randomblob(70000))");
+        assert_eq!(r, Err(QueryError::Sql("string or blob too big".into())));
+        let r = f.run("SELECT length(randomblob(65536))").unwrap();
+        assert_eq!(r.rows, [[json!(65536)]]);
 
         let long = format!("SELECT 1 -- {}", "x".repeat(100_000));
-        let r = f.run(&long);
-        assert!(matches!(r, Err(QueryError::Sql(_))), "{r:?}");
+        match f.run(&long) {
+            Err(QueryError::Sql(msg)) => assert!(msg.contains("too long"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn wide_row_refused() {
+        // The reviewer's 150 columns of 1 MB text each: refused before it runs.
+        let f = Fixture::new();
+        let cols: Vec<String> = (0..150)
+            .map(|i| format!("hex(zeroblob(499999)) AS c{i}"))
+            .collect();
+        match f.run(&format!("SELECT {}", cols.join(", "))) {
+            Err(QueryError::Sql(msg)) => assert!(msg.contains("too many columns"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn large_result_refused() {
+        // 300 rows of 60 KB text: each value is allowed, together they are 18 MB.
+        let f = Fixture::new();
+        let sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 300)
+                   SELECT hex(zeroblob(30000)) FROM n";
+        let r = f.run_with(sql, &BTreeMap::new(), limits(10_000));
+        assert_eq!(
+            r,
+            Err(QueryError::ResultTooLarge {
+                limit_bytes: 8_388_608
+            })
+        );
+    }
+
+    #[test]
+    fn full_log_frame_fits() {
+        // A dashboard reading every column of the row cap's worth of log rows.
+        let f = Fixture::new();
+        f.add_rows(10_000 - ROWS);
+        let frame = f
+            .run_with("SELECT * FROM queries", &BTreeMap::new(), limits(10_000))
+            .unwrap();
+        assert_eq!(frame.rows.len(), 10_000);
+        assert!(!frame.truncated);
+    }
+
+    #[test]
+    fn stacked_expensive_calls_are_stopped() {
+        // Each instr compares a 32 KB needle at every offset of a 64 KB haystack: about
+        // 0.3 s inside one VM step. Row after row, the progress handler stops them.
+        let f = Fixture::new();
+        let limits = QueryLimits {
+            timeout: Duration::from_millis(200),
+            row_cap: 100,
+        };
+        let per_row =
+            "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r WHERE x < 20),
+                       s(h) AS (SELECT hex(zeroblob(32760)))
+                       SELECT instr(h, hex(zeroblob(16380)) || '1') FROM r, s";
+        // Within one row no check runs between the calls; the row still counts as late.
+        let one_row = "WITH s(h, n) AS (SELECT hex(zeroblob(32767)), hex(zeroblob(16383)) || '1')
+                       SELECT instr(h, n) + instr(h, n) + instr(h, n) FROM s";
+        for sql in [per_row, one_row] {
+            let started = Instant::now();
+            let r = f.run_with(sql, &BTreeMap::new(), limits);
+            let took = started.elapsed();
+            assert_eq!(r, Err(QueryError::Timeout), "{sql}");
+            assert!(took < Duration::from_secs(2), "{took:?}: {sql}");
+        }
     }
 }
