@@ -49,7 +49,7 @@ Shadow means lacuna answers on host port 5300 while AdGuard keeps serving :53, s
 nothing in the house depends on it yet.
 
 **Every command in this section, in Cutover and in Rollback runs from this
-folder, `lacuna/deploy/`.** Nothing here needs a `cd`.
+folder, `~/lacuna/deploy/`.** Nothing here needs a `cd`.
 
 1. Create the network (once): `~/homelab/scripts/provision/networks.sh`. It adds
    `lacuna-api` (192.168.208.0/20, internal) next to the others.
@@ -176,7 +176,7 @@ First hour after cutover (the shadow run had no real clients, so this is the
 real load test). Until Sonder's dashboards exist, read the numbers through the
 API from the `lacuna-api` network (see `CONTRACT.md` for the call):
 
-- Counters, from `lacuna/deploy/` (a throwaway curl container on the API network;
+- Counters, from `~/lacuna/deploy/` (a throwaway curl container on the API network;
   the secret file is group 3070, hence `--group-add`):
   ```bash
   docker run --rm --network lacuna-api --group-add 3070 \
