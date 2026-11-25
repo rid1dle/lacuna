@@ -11,9 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use rusqlite::{params, Connection, Transaction};
-use tracing::warn;
+use tracing::{info, warn};
 
-use super::{rollup, Store};
+use super::{rollup, Store, LOG_DROPPED, LOG_LATE, QUERIES_TOTAL};
 use crate::codes::Source;
 use crate::dns::pipeline::{LogSink, QueryRecord};
 
@@ -46,6 +46,25 @@ pub struct Writer {
     rx: Receiver<QueryRecord>,
     dropped: Arc<AtomicU64>,
     pending: Vec<QueryRecord>,
+    /// The last write failed. Logged on the change only, not once a second.
+    pub(super) failing: bool,
+}
+
+/// Lets `serve` wait for the writer thread to finish its last batch.
+pub struct WriterHandle {
+    // The thread holds the only sender and never sends: dropping it when the thread
+    // ends (normally or by panic) is the signal.
+    done: Receiver<()>,
+}
+
+impl WriterHandle {
+    /// True once the thread has finished, false if `timeout` passed first.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        !matches!(
+            self.done.recv_timeout(timeout),
+            Err(RecvTimeoutError::Timeout)
+        )
+    }
 }
 
 pub fn channel(store: Store, capacity: usize) -> (LogSender, Writer) {
@@ -60,19 +79,24 @@ pub fn channel(store: Store, capacity: usize) -> (LogSender, Writer) {
         rx,
         dropped,
         pending: Vec::with_capacity(BATCH_MAX),
+        failing: false,
     };
     (sender, writer)
 }
 
-/// Starts the writer thread. It exits once every `LogSender` is dropped, after writing
-/// what it already received.
-pub fn spawn(store: Store, capacity: usize) -> LogSender {
+/// Starts the writer thread. Once every `LogSender` is dropped, the thread writes every
+/// record still in the channel and exits; the handle's `wait` sees that.
+pub fn spawn(store: Store, capacity: usize) -> (LogSender, WriterHandle) {
     let (sender, writer) = channel(store, capacity);
+    let (done_tx, done) = std::sync::mpsc::channel::<()>();
     std::thread::Builder::new()
         .name("log-writer".into())
-        .spawn(move || writer.run())
+        .spawn(move || {
+            let _done = done_tx;
+            writer.run();
+        })
         .expect("spawning the log writer thread");
-    sender
+    (sender, WriterHandle { done })
 }
 
 impl Writer {
@@ -81,9 +105,8 @@ impl Writer {
         let mut next_retain = Instant::now();
         loop {
             let open = self.collect(BATCH_WINDOW);
-            if let Err(e) = self.flush() {
-                warn!("query log batch lost: {e:#}");
-            }
+            // Errors are logged inside flush, on the change of state only.
+            let _ = self.flush();
             if !open {
                 return;
             }
@@ -130,7 +153,7 @@ impl Writer {
     }
 
     /// Writes `pending` and the drop count in one transaction. A failed batch is added
-    /// to the drop count, so the loss still shows in `counters`.
+    /// to the drop count, so the loss still shows in `counters` once writes recover.
     pub(super) fn flush(&mut self) -> Result<()> {
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         if self.pending.is_empty() && dropped == 0 {
@@ -139,8 +162,21 @@ impl Writer {
         let n = self.pending.len() as u64;
         let result = write_batch(&mut self.store.conn, &self.pending, dropped);
         self.pending.clear();
-        if result.is_err() {
-            self.dropped.fetch_add(n + dropped, Ordering::Relaxed);
+        match &result {
+            Ok(()) if self.failing => {
+                info!("query log writes recovered");
+                self.failing = false;
+            }
+            Ok(()) => {}
+            Err(e) => {
+                self.dropped.fetch_add(n + dropped, Ordering::Relaxed);
+                if !self.failing {
+                    warn!(
+                        "query log writes failing, records are dropped until they recover: {e:#}"
+                    );
+                    self.failing = true;
+                }
+            }
         }
         result
     }
@@ -148,9 +184,10 @@ impl Writer {
 
 fn write_batch(conn: &mut Connection, records: &[QueryRecord], dropped: u64) -> Result<()> {
     let tx = conn.transaction()?;
-    insert_batch(&tx, records, Source::Sieve)?;
-    add_counter(&tx, "log_dropped", dropped)?;
-    add_counter(&tx, "queries_total", records.len() as u64 + dropped)?;
+    let late = insert_batch(&tx, records, Source::Sieve)?;
+    add_counter(&tx, LOG_DROPPED, dropped)?;
+    add_counter(&tx, LOG_LATE, late)?;
+    add_counter(&tx, QUERIES_TOTAL, records.len() as u64 + dropped)?;
     tx.commit()?;
     Ok(())
 }
@@ -167,8 +204,14 @@ fn add_counter(tx: &Transaction, name: &str, by: u64) -> Result<()> {
 }
 
 /// Inserts raw rows, interning domain names and rule texts and recording each client
-/// as seen. Counters are the caller's business.
-pub fn insert_batch(tx: &Transaction, records: &[QueryRecord], source: Source) -> Result<()> {
+/// as seen. Rows behind the rollup marks are added to the rollups here, so they count
+/// exactly once; returns how many there were. Counters are the caller's business.
+pub fn insert_batch(tx: &Transaction, records: &[QueryRecord], source: Source) -> Result<u64> {
+    // New rows get rowids above the current maximum, which is how the late rollup
+    // finds this batch's rows.
+    let before: i64 = tx.query_row("SELECT coalesce(max(rowid), 0) FROM raw_queries", [], |r| {
+        r.get(0)
+    })?;
     let mut put_domain = tx.prepare("INSERT OR IGNORE INTO domain_names (name) VALUES (?1)")?;
     let mut get_domain = tx.prepare("SELECT id FROM domain_names WHERE name = ?1")?;
     let mut put_rule =
@@ -200,6 +243,13 @@ pub fn insert_batch(tx: &Transaction, records: &[QueryRecord], source: Source) -
                 id
             }
         };
+        // The pipeline builds both from one Option<(list, rule)>, so one without the
+        // other cannot happen; such a record would be logged without its rule.
+        debug_assert_eq!(
+            r.list_id.is_some(),
+            r.rule.is_some(),
+            "list_id and rule differ"
+        );
         let rule_id = match (r.list_id, r.rule.as_deref()) {
             (Some(list), Some(text)) => Some(match rules.get(&(list, text)) {
                 Some(&id) => id,
@@ -240,7 +290,7 @@ pub fn insert_batch(tx: &Transaction, records: &[QueryRecord], source: Source) -
     for (ip, (first, last)) in clients {
         put_client.execute(params![ip.to_string(), first, last])?;
     }
-    Ok(())
+    rollup::roll_late(tx, before)
 }
 
 fn now_ms() -> i64 {
@@ -351,7 +401,7 @@ mod tests {
             .store
             .conn
             .prepare(
-                "SELECT client, device, origin, first_seen, last_seen FROM devices ORDER BY client",
+                "SELECT client, device, origin, first_seen_ts, last_seen_ts FROM devices ORDER BY client",
             )
             .unwrap();
         let rows: Vec<(String, String, Option<String>, i64, i64)> = stmt
@@ -370,6 +420,48 @@ mod tests {
         );
     }
 
+    /// A batch that cannot be written is counted as dropped, so the loss shows up in
+    /// `counters` once the disk recovers.
+    #[test]
+    fn failed_batch_counts_as_dropped() {
+        let (tx, mut w) = channel(memory(), 16);
+        for i in 0..3 {
+            tx.send(record(i, "10.0.0.1", "a.example"));
+        }
+        assert!(w.collect(Duration::ZERO));
+        w.store
+            .conn
+            .execute_batch("ALTER TABLE raw_queries RENAME TO raw_queries_away")
+            .unwrap();
+        assert!(w.flush().is_err());
+        assert!(w.failing, "the failure is remembered, so it is logged once");
+        w.store
+            .conn
+            .execute_batch("ALTER TABLE raw_queries_away RENAME TO raw_queries")
+            .unwrap();
+        w.flush().unwrap();
+        assert!(!w.failing);
+        assert_eq!(counter(&w.store, "log_dropped"), 3);
+        assert_eq!(counter(&w.store, "queries_total"), 3);
+        assert_eq!(count(&w.store, "raw_queries"), 0);
+    }
+
+    /// Dropping the last sender makes the thread write everything it holds and finish;
+    /// `wait` sees that, so a shutdown loses nothing already sent.
+    #[test]
+    fn spawned_writer_drains_on_shutdown() {
+        let db = TempDb::new("drain");
+        let (tx, writer) = spawn(Store::open(&db.0).unwrap(), 4096);
+        let now = now_ms();
+        for i in 0..3000 {
+            tx.send(record(now + i, "10.0.0.1", "a.example"));
+        }
+        drop(tx);
+        assert!(writer.wait(Duration::from_secs(3)), "writer did not finish");
+        let reader = Store::open(&db.0).unwrap();
+        assert_eq!(count(&reader, "raw_queries"), 3000);
+    }
+
     #[test]
     fn disconnected_channel_ends_collect() {
         let (tx, mut w) = channel(memory(), 4);
@@ -385,7 +477,7 @@ mod tests {
     #[test]
     fn spawned_writer_persists_records() {
         let db = TempDb::new("writer");
-        let tx = spawn(Store::open(&db.0).unwrap(), 16);
+        let (tx, _writer) = spawn(Store::open(&db.0).unwrap(), 16);
         tx.send(record(now_ms(), "10.0.0.1", "a.example"));
         let reader = Store::open(&db.0).unwrap();
         let started = Instant::now();

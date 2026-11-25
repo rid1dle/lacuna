@@ -37,35 +37,75 @@ pub fn roll_up(store: &Store, now_ms: i64) -> Result<()> {
     let from = meta(&tx, ROLLED_HOURLY)?.unwrap_or(0);
     let to = settled - settled.rem_euclid(HOUR_MS);
     if to > from {
-        // Upsert, so counts written straight into the rollups (the AdGuard import) add up.
-        tx.execute(
-            "INSERT INTO hourly_counts (hour_ms, client, outcome, n, latency_us_sum)
-             SELECT ts - ts % ?3, client, outcome, count(*), sum(latency_us)
-             FROM raw_queries WHERE ts >= ?1 AND ts < ?2
-             GROUP BY 1, 2, 3
-             ON CONFLICT (hour_ms, client, outcome) DO UPDATE SET
-                 n = n + excluded.n,
-                 latency_us_sum = latency_us_sum + excluded.latency_us_sum",
-            params![from, to, HOUR_MS],
-        )?;
+        roll_hourly(&tx, IN_RANGE, from, to)?;
         set_meta(&tx, ROLLED_HOURLY, to)?;
     }
-
     let from = meta(&tx, ROLLED_DAILY)?.unwrap_or(0);
-    let to = ist_day(settled) * DAY_MS - IST_OFFSET_MS;
+    let to = ist_day_start(settled);
     if to > from {
-        tx.execute(
-            "INSERT INTO daily_counts (day, client, domain_id, outcome, rule_id, n)
-             SELECT (ts + ?3) / ?4, client, domain_id, outcome, coalesce(rule_id, 0), count(*)
-             FROM raw_queries WHERE ts >= ?1 AND ts < ?2
-             GROUP BY 1, 2, 3, 4, 5
-             ON CONFLICT (day, client, domain_id, outcome, rule_id) DO UPDATE SET
-                 n = n + excluded.n",
-            params![from, to, IST_OFFSET_MS, DAY_MS],
-        )?;
+        roll_daily(&tx, IN_RANGE, from, to)?;
         set_meta(&tx, ROLLED_DAILY, to)?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Adds rows inserted after `after_rowid` whose `ts` is behind a mark to that rollup,
+/// since the scheduled rollup starts at the mark and would never see them. Runs in the
+/// inserting transaction. Returns how many rows were behind either mark.
+pub(super) fn roll_late(conn: &Connection, after_rowid: i64) -> Result<u64> {
+    // No mark yet means nothing was rolled up, so nothing can be late.
+    let hourly = meta(conn, ROLLED_HOURLY)?.unwrap_or(0);
+    let daily = meta(conn, ROLLED_DAILY)?.unwrap_or(0);
+    let late: i64 = conn.query_row(
+        "SELECT count(*) FROM raw_queries WHERE rowid > ?1 AND ts < ?2",
+        params![after_rowid, hourly.max(daily)],
+        |r| r.get(0),
+    )?;
+    if late > 0 {
+        roll_hourly(conn, LATE, after_rowid, hourly)?;
+        roll_daily(conn, LATE, after_rowid, daily)?;
+    }
+    Ok(u64::try_from(late).unwrap_or(0))
+}
+
+/// Raw rows a rollup reads: a `ts` range (the scheduled rollup, through the ts index),
+/// or rows after a rowid that are behind a mark (late rows).
+const IN_RANGE: &str = "ts >= ?1 AND ts < ?2";
+const LATE: &str = "rowid > ?1 AND ts < ?2";
+
+/// Upserts, so counts already in the rollups (late rows, the AdGuard import) add up.
+fn roll_hourly(conn: &Connection, rows: &str, a: i64, b: i64) -> Result<()> {
+    conn.execute(
+        &format!(
+            "INSERT INTO hourly_counts (hour_ms, client, outcome, n, latency_us_sum)
+             SELECT ts - ts % ?3, client, outcome, count(*), sum(latency_us)
+             FROM raw_queries WHERE {rows}
+             GROUP BY 1, 2, 3
+             ON CONFLICT (hour_ms, client, outcome) DO UPDATE SET
+                 n = n + excluded.n,
+                 latency_us_sum = latency_us_sum + excluded.latency_us_sum"
+        ),
+        params![a, b, HOUR_MS],
+    )?;
+    Ok(())
+}
+
+/// `day_ts` is the IST midnight before `ts`: whole days are counted from 1970-01-01
+/// 00:00 IST, then shifted back to UTC milliseconds.
+fn roll_daily(conn: &Connection, rows: &str, a: i64, b: i64) -> Result<()> {
+    conn.execute(
+        &format!(
+            "INSERT INTO daily_counts (day_ts, client, domain_id, outcome, rule_id, n)
+             SELECT (ts + ?3) / ?4 * ?4 - ?3, client, domain_id, outcome,
+                    coalesce(rule_id, 0), count(*)
+             FROM raw_queries WHERE {rows}
+             GROUP BY 1, 2, 3, 4, 5
+             ON CONFLICT (day_ts, client, domain_id, outcome, rule_id) DO UPDATE SET
+                 n = n + excluded.n"
+        ),
+        params![a, b, IST_OFFSET_MS, DAY_MS],
+    )?;
     Ok(())
 }
 
@@ -94,15 +134,15 @@ pub fn retain(store: &Store, now_ms: i64) -> Result<()> {
     delete_chunked(
         conn,
         "DELETE FROM daily_counts WHERE rowid IN \
-         (SELECT rowid FROM daily_counts WHERE day < ?1 LIMIT ?2)",
-        ist_day(rollup_cutoff),
+         (SELECT rowid FROM daily_counts WHERE day_ts < ?1 LIMIT ?2)",
+        ist_day_start(rollup_cutoff),
     )?;
     Ok(())
 }
 
-/// The house day number of a unix ms time (days since 1970-01-01 in IST).
-fn ist_day(ms: i64) -> i64 {
-    (ms + IST_OFFSET_MS).div_euclid(DAY_MS)
+/// The IST midnight (unix ms) that starts the house day containing `ms`.
+fn ist_day_start(ms: i64) -> i64 {
+    (ms + IST_OFFSET_MS).div_euclid(DAY_MS) * DAY_MS - IST_OFFSET_MS
 }
 
 /// Runs a `DELETE ... LIMIT ?2` until it deletes fewer than a full chunk. Outside a
@@ -134,9 +174,9 @@ mod tests {
 
     use super::*;
     use crate::codes::{Outcome, Source};
-    use crate::dns::pipeline::QueryRecord;
+    use crate::dns::pipeline::{LogSink, QueryRecord};
     use crate::store::testing::record;
-    use crate::store::{writer, Store, DAY_MS};
+    use crate::store::{writer, Store, DAY_MS, HOUR_MS};
 
     /// 2026-11-24T19:00:00Z, which is 2026-11-25 00:30 in IST.
     const T19: i64 = 1_795_546_800_000;
@@ -265,6 +305,53 @@ mod tests {
                 "2".into()
             ]]
         );
+    }
+
+    /// A row that arrives behind the rollup marks is counted in the same batch, exactly
+    /// once, and survives retention of its raw row.
+    #[test]
+    fn late_rows_are_rolled_up_once() {
+        let store = store_with(&three_records());
+        run(&store, NEXT_DAY).unwrap();
+
+        let (tx, mut w) = writer::channel(store, 4);
+        tx.send(record(T19 + 5 * 60_000, "10.0.0.1", "x.example"));
+        tx.send(record(NEXT_DAY, "10.0.0.1", "x.example"));
+        assert!(w.collect(std::time::Duration::ZERO));
+        w.flush().unwrap();
+        let store = &w.store;
+
+        let late: Vec<Vec<i64>> = rows(store, "SELECT value FROM counters WHERE name = 'log_late'");
+        assert_eq!(late, vec![vec![1]]);
+        let t19: Vec<Vec<i64>> = rows(
+            store,
+            &format!("SELECT n FROM hourly WHERE hour_ts = {T19}"),
+        );
+        assert_eq!(t19, vec![vec![3]]);
+        let x: Vec<Vec<i64>> = rows(store, "SELECT n FROM daily WHERE domain = 'x.example'");
+        assert_eq!(x, vec![vec![3]]);
+
+        // The scheduled rollup picks up the on-time row only.
+        run(store, NEXT_DAY + 2 * HOUR_MS).unwrap();
+        let totals = |store: &Store| -> Vec<Vec<i64>> {
+            rows(
+                store,
+                &format!(
+                    "SELECT (SELECT sum(n) FROM hourly), (SELECT sum(n) FROM daily), \
+                     (SELECT n FROM hourly WHERE hour_ts = {T19})"
+                ),
+            )
+        };
+        assert_eq!(totals(store), vec![vec![5, 4, 3]]);
+
+        retain(store, NEXT_DAY + 31 * DAY_MS).unwrap();
+        let raw: Vec<Vec<i64>> = rows(store, "SELECT count(*) FROM raw_queries");
+        assert_eq!(
+            raw,
+            vec![vec![1]],
+            "only the row in the open IST day is kept"
+        );
+        assert_eq!(totals(store), vec![vec![5, 4, 3]]);
     }
 
     #[test]

@@ -15,10 +15,10 @@ use anyhow::{Context, Result};
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RecordType};
 use tokio::runtime::Builder;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::filter::LevelFilter;
 
-use dns::pipeline::{self, LiveConfig, LogSink, Pipeline};
+use dns::pipeline::{self, LiveConfig, LogSink, NoopSink, Pipeline};
 use dns::server::{self, Listeners};
 use dns::upstream::{UdpUpstream, Upstream, Upstreams};
 use store::{writer, Retention, Store};
@@ -29,6 +29,10 @@ const USAGE: &str = "usage: sieve <check-config <path> | serve <path> | \
 /// `ask` waits this long for an answer, UDP plus a TCP retry.
 const ASK_TIMEOUT: Duration = Duration::from_secs(2);
 const ASK_SERVER: &str = "127.0.0.1:5353";
+/// At shutdown: how long tokio tasks get to finish, then how long the log writer gets
+/// to write what it holds. Both bounded so `docker stop` never hangs on them.
+const TASKS_GRACE: Duration = Duration::from_secs(1);
+const LOG_DRAIN: Duration = Duration::from_secs(3);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -70,12 +74,7 @@ fn serve(path: &Path) -> ExitCode {
         .unwrap_or(LevelFilter::INFO);
     tracing_subscriber::fmt().with_max_level(level).init();
 
-    let result = Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("starting the tokio runtime")
-        .and_then(|rt| rt.block_on(serve_dns(path)));
-    match result {
+    match serve_with_log(path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e:#}");
@@ -84,16 +83,54 @@ fn serve(path: &Path) -> ExitCode {
     }
 }
 
-async fn serve_dns(path: &Path) -> Result<()> {
+/// Starts the query log, serves DNS until a shutdown signal, then lets the log writer
+/// finish its last batch.
+fn serve_with_log(path: &Path) -> Result<()> {
     let config = config::Config::load(path)?;
-    let mut store = Store::open(&config.store.path)?;
-    store.retention = Retention {
-        raw_days: config.store.raw_days,
-        rollup_days: config.store.rollup_days,
-    };
-    info!(path = %config.store.path.display(), "query log open");
-    let log: Arc<dyn LogSink> = Arc::new(writer::spawn(store, writer::CHANNEL_CAPACITY));
+    let (log, writer) = start_log(open_store(&config.store));
+    let rt = Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the tokio runtime")?;
+    let result = rt.block_on(serve_dns(&config, Arc::clone(&log)));
+    // Shutting the runtime down drops the tasks' clones of the sink; dropping ours
+    // closes the channel, and the writer writes what it holds and exits.
+    rt.shutdown_timeout(TASKS_GRACE);
+    drop(log);
+    if let Some(writer) = writer {
+        if !writer.wait(LOG_DRAIN) {
+            warn!("query log writer still busy after {LOG_DRAIN:?}, exiting anyway");
+        }
+    }
+    result
+}
 
+fn open_store(c: &config::StoreConfig) -> Result<Store> {
+    let mut store = Store::open(&c.path)?;
+    store.retention = Retention {
+        raw_days: c.raw_days,
+        rollup_days: c.rollup_days,
+    };
+    info!(path = %c.path.display(), "query log open");
+    Ok(store)
+}
+
+/// DNS never depends on the log: a store that fails to open (I/O, corruption, a newer
+/// schema) is logged and DNS runs with a sink that drops every record.
+fn start_log(opened: Result<Store>) -> (Arc<dyn LogSink>, Option<writer::WriterHandle>) {
+    match opened {
+        Ok(store) => {
+            let (sender, handle) = writer::spawn(store, writer::CHANNEL_CAPACITY);
+            (Arc::new(sender), Some(handle))
+        }
+        Err(e) => {
+            error!("query log unavailable, serving DNS without it: {e:#}");
+            (Arc::new(NoopSink), None)
+        }
+    }
+}
+
+async fn serve_dns(config: &config::Config, log: Arc<dyn LogSink>) -> Result<()> {
     // User rules only for now; filter lists join the set when the list manager lands.
     let (rules, stats) = rules::RuleSet::build(&config.user_rules, &[]);
     let skipped: usize = stats.iter().flat_map(|s| s.skipped.values()).sum();
@@ -101,7 +138,7 @@ async fn serve_dns(path: &Path) -> Result<()> {
 
     let pipeline = Arc::new(Pipeline::new(
         pipeline::shared(rules),
-        pipeline::shared(LiveConfig::from_config(&config)),
+        pipeline::shared(LiveConfig::from_config(config)),
         Upstreams::from_config(&config.upstreams)?,
         config.dns.max_inflight,
     ));
@@ -220,11 +257,34 @@ fn ask(a: &Ask) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::pipeline::shared;
     use crate::dns::pipeline::testing::{live, rules, upstreams, State};
-    use crate::dns::pipeline::{shared, NoopSink};
+    use crate::store::testing::TempDb;
     use hickory_proto::op::ResponseCode;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// DNS never depends on the log: a store that cannot open leaves a no-op sink.
+    #[test]
+    fn log_failure_does_not_stop_dns() {
+        let (_, writer) = start_log(Err(anyhow::anyhow!("disk gone")));
+        assert!(writer.is_none());
+
+        // A database from a newer sieve is refused by the store; serve carries on.
+        let db = TempDb::new("newer");
+        Store::open(&db.0).unwrap();
+        rusqlite::Connection::open(&db.0)
+            .unwrap()
+            .execute("UPDATE meta SET value = 2 WHERE key = 'schema_version'", [])
+            .unwrap();
+        let (_, writer) = start_log(Store::open(&db.0));
+        assert!(writer.is_none());
+
+        let (log, writer) = start_log(Store::open(Path::new(":memory:")));
+        let writer = writer.expect("a store that opens gets a writer");
+        drop(log);
+        assert!(writer.wait(Duration::from_secs(3)));
+    }
 
     #[test]
     fn ask_defaults_and_flags() {

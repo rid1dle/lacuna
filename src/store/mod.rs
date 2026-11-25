@@ -1,7 +1,7 @@
 //! The SQLite query log: schema, migration and the one write connection.
 //!
-//! Tables are internal; the views in schema.sql are the public contract (schemaVersion 1)
-//! that Sonder's dashboards query with their own SQL.
+//! Tables (schema.sql) are internal; the views (views.sql) are the public contract
+//! (schemaVersion 1) that Sonder's dashboards query with their own SQL.
 
 pub mod rollup;
 pub mod writer;
@@ -17,7 +17,14 @@ use crate::codes::{Outcome, Reason, ServedFrom, Source};
 
 /// The schema version this build creates and understands.
 const SCHEMA_VERSION: i64 = 1;
-const SCHEMA_TEMPLATE: &str = include_str!("schema.sql");
+const TABLES_SQL: &str = include_str!("schema.sql");
+const VIEWS_TEMPLATE: &str = include_str!("views.sql");
+
+/// Counter names in `counter_values`. Each exists from the first open, at 0.
+pub const LOG_DROPPED: &str = "log_dropped";
+pub const LOG_LATE: &str = "log_late";
+pub const QUERIES_TOTAL: &str = "queries_total";
+const COUNTERS: &[&str] = &[LOG_DROPPED, LOG_LATE, QUERIES_TOTAL];
 
 pub const HOUR_MS: i64 = 3_600_000;
 pub const DAY_MS: i64 = 86_400_000;
@@ -26,6 +33,16 @@ pub const IST_OFFSET_MS: i64 = 19_800_000;
 
 /// The list id of the user rules from config.toml.
 const USER_LIST_ID: u32 = 0;
+
+/// Response codes the views name (RFC 1035 and 2136 mnemonics); others show as `RCODE<n>`.
+const RCODE_LABELS: &[(u16, &str)] = &[
+    (0, "NOERROR"),
+    (1, "FORMERR"),
+    (2, "SERVFAIL"),
+    (3, "NXDOMAIN"),
+    (4, "NOTIMP"),
+    (5, "REFUSED"),
+];
 
 /// Record types the views name; any other shows as `TYPE<n>`, the RFC 3597 spelling.
 const TYPE_LABELS: &[(u16, &str)] = &[
@@ -95,8 +112,9 @@ impl Store {
     }
 }
 
-/// No `meta` table: a new database, so create everything. Version 1: nothing to do.
-/// Anything else is refused rather than written to.
+/// No `meta` table: a new database, so create the tables. Version 1: keep them. Anything
+/// else is refused rather than written to. Then, on every open, the views are rebuilt
+/// from this build's enums and every counter is made to exist.
 fn migrate(conn: &mut Connection) -> Result<()> {
     // IMMEDIATE takes the write lock before reading the version, so two processes
     // opening a new file cannot both create the schema.
@@ -107,66 +125,87 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         |r| r.get(0),
     )?;
     if has_meta == 0 {
-        tx.execute_batch(&schema_sql())?;
-        tx.commit()?;
-        return Ok(());
+        tx.execute_batch(TABLES_SQL)?;
+    } else {
+        let version: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match version {
+            Some(SCHEMA_VERSION) => {}
+            Some(v) if v > SCHEMA_VERSION => bail!(
+                "schema_version {v} is newer than this sieve understands ({SCHEMA_VERSION}); \
+                 refusing to start rather than write to it"
+            ),
+            other => bail!("not a sieve database: meta.schema_version is {other:?}"),
+        }
     }
-    let version: Option<i64> = tx
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    match version {
-        Some(SCHEMA_VERSION) => Ok(()),
-        Some(v) if v > SCHEMA_VERSION => bail!(
-            "schema_version {v} is newer than this sieve understands ({SCHEMA_VERSION}); \
-             refusing to start rather than write to it"
-        ),
-        other => bail!("not a sieve database: meta.schema_version is {other:?}"),
+
+    let views: Vec<String> = tx
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'view'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for view in views {
+        tx.execute_batch(&format!("DROP VIEW \"{}\"", view.replace('"', "\"\"")))?;
     }
+    tx.execute_batch(&views_sql())?;
+    for name in COUNTERS {
+        tx.execute(
+            "INSERT OR IGNORE INTO counter_values (name, value) VALUES (?1, 0)",
+            [name],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
-/// schema.sql with its label placeholders filled in from the Rust enums.
-fn schema_sql() -> String {
+/// views.sql with its placeholders filled in from the Rust enums and constants.
+fn views_sql() -> String {
     let list_name =
         format!("CASE WHEN r.list_id = {USER_LIST_ID} THEN 'user rules' ELSE l.name END");
-    SCHEMA_TEMPLATE
+    let codes = |column: &str, arms: Vec<(u8, &'static str)>| case_sql(column, arms, "NULL");
+    VIEWS_TEMPLATE
         .replace("{type_label}", &type_label_sql("qtype"))
         .replace(
+            "{rcode_label}",
+            &case_sql("rcode", RCODE_LABELS.iter().copied(), "'RCODE' || rcode"),
+        )
+        .replace(
             "{outcome_label}",
-            &case_sql(
+            &codes(
                 "outcome",
-                Outcome::ALL.iter().map(|v| (v.code(), v.label())),
-                "NULL",
+                Outcome::ALL.iter().map(|v| (v.code(), v.label())).collect(),
             ),
         )
         .replace(
             "{reason_label}",
-            &case_sql(
+            &codes(
                 "reason",
-                Reason::ALL.iter().map(|v| (v.code(), v.label())),
-                "NULL",
+                Reason::ALL.iter().map(|v| (v.code(), v.label())).collect(),
             ),
         )
         .replace(
             "{served_from_label}",
-            &case_sql(
+            &codes(
                 "served_from",
-                ServedFrom::ALL.iter().map(|v| (v.code(), v.label())),
-                "NULL",
+                ServedFrom::ALL
+                    .iter()
+                    .map(|v| (v.code(), v.label()))
+                    .collect(),
             ),
         )
         .replace(
             "{source_label}",
-            &case_sql(
+            &codes(
                 "source",
-                Source::ALL.iter().map(|v| (v.code(), v.label())),
-                "NULL",
+                Source::ALL.iter().map(|v| (v.code(), v.label())).collect(),
             ),
         )
         .replace("{list_name}", &list_name)
+        .replace("{ist_offset_ms}", &IST_OFFSET_MS.to_string())
 }
 
 fn type_label_sql(column: &str) -> String {
@@ -340,11 +379,177 @@ mod tests {
         );
     }
 
-    /// Every enum variant's label must come back through the views; a variant added to
-    /// codes.rs but missing from the views would read as NULL here.
     #[test]
     fn every_code_label_round_trips_through_views() {
+        assert_labels_round_trip(&mut memory());
+    }
+
+    /// Views are rebuilt from this build's enums on every open, so a database created
+    /// by an older build (or a damaged view) gets the current labels.
+    #[test]
+    fn views_are_rebuilt_on_open() {
+        let db = TempDb::new("views");
+        Store::open(&db.0)
+            .unwrap()
+            .conn
+            .execute_batch(
+                "DROP VIEW queries;
+                 CREATE VIEW queries AS SELECT ts, 'stale' AS outcome, 'stale' AS reason,
+                     'stale' AS served_from, 'stale' AS source FROM raw_queries;",
+            )
+            .unwrap();
+        assert_labels_round_trip(&mut Store::open(&db.0).unwrap());
+    }
+
+    /// The column lists are the frozen v1 contract; changing one is a schemaVersion bump.
+    #[test]
+    fn view_columns_are_the_contract() {
+        let store = memory();
+        let contract: &[(&str, &[&str])] = &[
+            (
+                "queries",
+                &[
+                    "ts",
+                    "time",
+                    "client",
+                    "device",
+                    "domain",
+                    "type",
+                    "rcode",
+                    "outcome",
+                    "reason",
+                    "rule",
+                    "list_id",
+                    "list",
+                    "served_from",
+                    "upstream",
+                    "latency_ms",
+                    "answers",
+                    "source",
+                ],
+            ),
+            (
+                "hourly",
+                &[
+                    "hour_ts",
+                    "client",
+                    "device",
+                    "outcome",
+                    "n",
+                    "avg_latency_ms",
+                ],
+            ),
+            (
+                "daily",
+                &[
+                    "day", "day_ts", "client", "device", "domain", "outcome", "rule", "list_id",
+                    "list", "n",
+                ],
+            ),
+            (
+                "devices",
+                &[
+                    "client",
+                    "device",
+                    "origin",
+                    "first_seen_ts",
+                    "last_seen_ts",
+                ],
+            ),
+            (
+                "lists",
+                &[
+                    "id",
+                    "name",
+                    "url",
+                    "enabled",
+                    "parsed",
+                    "skipped_json",
+                    "fetched_ts",
+                    "last_error",
+                ],
+            ),
+            ("rules", &["id", "list_id", "list", "text"]),
+            ("counters", &["name", "value"]),
+        ];
+        for &(view, columns) in contract {
+            let stmt = store
+                .conn
+                .prepare(&format!("SELECT * FROM {view}"))
+                .unwrap();
+            assert_eq!(stmt.column_names().collect::<Vec<_>>(), columns, "{view}");
+        }
+        let views: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'view'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(views, contract.len() as i64);
+    }
+
+    /// The documented range filters must reach an index on the base table, never a scan.
+    #[test]
+    fn range_filters_use_indexes() {
+        let store = memory();
+        for sql in [
+            "SELECT * FROM queries WHERE ts >= 1",
+            "SELECT * FROM queries WHERE client = '10.0.0.1' AND ts >= 1",
+            "SELECT * FROM hourly WHERE hour_ts >= 1",
+            "SELECT * FROM daily WHERE day_ts >= 1",
+        ] {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let plan: Vec<String> = stmt
+                .query_map([], |r| r.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN")),
+                "{sql}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rcode_labels() {
         let mut store = memory();
+        let codes = [0u16, 1, 2, 3, 4, 5, 99];
+        let records: Vec<_> = codes
+            .iter()
+            .enumerate()
+            .map(|(i, &rcode)| {
+                let mut r = record(i as i64, "10.0.0.1", "a.example");
+                r.rcode = rcode;
+                r
+            })
+            .collect();
+        let tx = store.conn.transaction().unwrap();
+        writer::insert_batch(&tx, &records, Source::Sieve).unwrap();
+        tx.commit().unwrap();
+        let mut stmt = store
+            .conn
+            .prepare("SELECT rcode FROM queries ORDER BY ts")
+            .unwrap();
+        let got: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            got,
+            ["NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED", "RCODE99"]
+        );
+    }
+
+    /// Every enum label comes back through the views; a variant added to codes.rs but
+    /// missing from the views would read as NULL here.
+    fn assert_labels_round_trip(store: &mut Store) {
         let n = [
             Outcome::ALL.len(),
             Reason::ALL.len(),
@@ -399,7 +604,7 @@ mod tests {
             assert_eq!(*row, want, "row {k}");
         }
         // hourly and daily carry outcome labels too.
-        rollup::run(&store, 3 * DAY_MS).unwrap();
+        rollup::run(store, 3 * DAY_MS).unwrap();
         for view in ["hourly", "daily"] {
             let mut stmt = store
                 .conn
@@ -444,8 +649,18 @@ mod tests {
 
     #[test]
     fn schema_has_no_unfilled_placeholders() {
-        let sql = schema_sql();
-        assert!(!sql.contains('{'), "placeholder left in schema");
+        assert!(!views_sql().contains('{'), "placeholder left in views");
+        assert!(!TABLES_SQL.contains('{'), "tables take no placeholders");
+    }
+
+    /// Day length and the IST offset come from the Rust constants, never typed into SQL.
+    #[test]
+    fn templates_have_no_time_literals() {
+        for (file, text) in [("schema.sql", TABLES_SQL), ("views.sql", VIEWS_TEMPLATE)] {
+            for literal in ["86400", "19800", "3600"] {
+                assert!(!text.contains(literal), "{file} contains {literal}");
+            }
+        }
     }
 
     #[test]
@@ -509,7 +724,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows,
-            vec![("log_dropped".into(), 0), ("queries_total".into(), 0)]
+            vec![
+                ("log_dropped".into(), 0),
+                ("log_late".into(), 0),
+                ("queries_total".into(), 0)
+            ]
         );
     }
 
@@ -525,19 +744,19 @@ mod tests {
             .unwrap();
         let mut stmt = store
             .conn
-            .prepare("SELECT list, text FROM rules ORDER BY id")
+            .prepare("SELECT list_id, list, text FROM rules ORDER BY id")
             .unwrap();
-        let rows: Vec<(Option<String>, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        let rows: Vec<(i64, Option<String>, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(
             rows,
             vec![
-                (Some("AdGuard DNS filter".into()), "||a.com^".into()),
-                (Some("user rules".into()), "||b.com^".into()),
-                (None, "||c.com^".into()),
+                (1, Some("AdGuard DNS filter".into()), "||a.com^".into()),
+                (0, Some("user rules".into()), "||b.com^".into()),
+                (9, None, "||c.com^".into()),
             ]
         );
         let name: String = store

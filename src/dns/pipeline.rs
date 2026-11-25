@@ -47,11 +47,9 @@ pub trait LogSink: Send + Sync {
     fn send(&self, r: QueryRecord);
 }
 
-/// Drops every record.
-#[cfg(test)]
+/// Drops every record: used when the query log cannot open.
 pub struct NoopSink;
 
-#[cfg(test)]
 impl LogSink for NoopSink {
     fn send(&self, _: QueryRecord) {}
 }
