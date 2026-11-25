@@ -1,6 +1,7 @@
 mod codes;
 mod config;
 mod dns;
+mod lists;
 mod rules;
 mod store;
 
@@ -20,7 +21,8 @@ use tracing_subscriber::filter::LevelFilter;
 
 use dns::pipeline::{self, LiveConfig, LogSink, NoopSink, Pipeline};
 use dns::server::{self, Listeners};
-use dns::upstream::{UdpUpstream, Upstream, Upstreams};
+use dns::upstream::{Remote, UdpUpstream, Upstream, Upstreams};
+use lists::{HttpFetcher, Lists};
 use store::{writer, Retention, Store};
 
 const USAGE: &str = "usage: sieve <check-config <path> | serve <path> | \
@@ -131,25 +133,48 @@ fn start_log(opened: Result<Store>) -> (Arc<dyn LogSink>, Option<writer::WriterH
 }
 
 async fn serve_dns(config: &config::Config, log: Arc<dyn LogSink>) -> Result<()> {
-    // User rules only for now; filter lists join the set when the list manager lands.
-    let (rules, stats) = rules::RuleSet::build(&config.user_rules, &[]);
-    let skipped: usize = stats.iter().flat_map(|s| s.skipped.values()).sum();
-    info!(rules = rules.rule_count(), skipped, "user rules loaded");
+    // User rules first so DNS never starts with an empty set, then the last good lists
+    // from disk (blocking is fine: nothing is listening yet).
+    let (user_only, _) = rules::RuleSet::build(&config.user_rules, &[]);
+    let rules = pipeline::shared(user_only);
+    let lists = Arc::new(Lists::new(
+        config.lists.clone(),
+        config.user_rules.clone(),
+        config.store.lists_dir.clone(),
+        config.store.path.clone(),
+        Arc::clone(&rules),
+        HttpFetcher::from_config(&config.upstreams)?,
+    ));
+    lists.sync_meta().await;
+    if let Err(e) = lists.load_last_good().await {
+        error!("loading last good lists, serving user rules only: {e:#}");
+    }
 
     let pipeline = Arc::new(Pipeline::new(
-        pipeline::shared(rules),
+        rules,
         pipeline::shared(LiveConfig::from_config(config)),
         Upstreams::from_config(&config.upstreams)?,
         config.dns.max_inflight,
     ));
     let listeners = Listeners::bind(config.dns.listen).await?;
     info!(addr = %listeners.local_addr()?, "dns listening on udp and tcp");
+    tokio::spawn(refresh_loop(lists));
     tokio::select! {
         () = server::run(pipeline, listeners, log) => Ok(()),
         stop = shutdown_signal() => {
             info!("shutting down");
             stop
         }
+    }
+}
+
+/// First refresh shortly after start, then daily. A failed refresh is logged and the
+/// next one tries again; the running rules are never touched by a failure.
+async fn refresh_loop(lists: Arc<Lists<HttpFetcher<Remote>>>) {
+    tokio::time::sleep(lists::FIRST_REFRESH).await;
+    loop {
+        info!("{}", lists.refresh().await.summary());
+        tokio::time::sleep(lists::REFRESH_EVERY).await;
     }
 }
 

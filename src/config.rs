@@ -60,9 +60,8 @@ pub struct DohUpstream {
     pub bootstrap: Vec<IpAddr>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // Name, url and enabled are read by Task 9's list manager.
 pub struct ListConfig {
     pub id: u32,
     pub name: String,
@@ -95,7 +94,6 @@ pub struct StoreConfig {
     pub path: PathBuf,
     pub raw_days: u32,
     pub rollup_days: u32,
-    #[allow(dead_code)] // Read by Task 9's list manager.
     pub lists_dir: PathBuf,
 }
 
