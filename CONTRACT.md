@@ -68,7 +68,7 @@ Host: lacuna:8053
 Authorization: Bearer 7f3c9a...
 ```
 
-Response `200`, abridged: the real one lists all seven views with every column, both
+Response `200`, abridged: the real one lists all eight views with every column, both
 variables, all five dashboards with every panel, and all five actions. Each part's
 shape is shown in full once.
 
@@ -138,16 +138,17 @@ or `text`. lacuna's internal tables (`raw_queries`, `hourly_counts`, ...) are re
 too, but they may change in any release without notice; the views do not change within
 a `schemaVersion`.
 
-The seven views in version 1:
+The eight views in version 1:
 
 | View | Rows | Bound it by (indexed) |
 |---|---|---|
-| `queries` | every query, kept 30 days | `ts`, or `client` with `ts` |
+| `queries` | every query, kept 30 days | `ts`, `client` with `ts`, or `domain_id` with `ts` |
 | `hourly` | counts per hour, client and outcome, kept a year | `hour_ts` |
 | `daily` | counts per IST day, client, domain, outcome and rule, kept a year | `day_ts` |
 | `devices` | every client seen, with its name | (small) |
 | `lists` | filter lists from the config, with their last fetch | (small) |
-| `rules` | rule texts of the loaded lists, and user rules that have decided a query | (scanned) |
+| `rules` | every rule text ever loaded; `live` is 1 for the rules in force now | (scanned) |
+| `domains` | every name ever asked for, with the `id` that `queries.domain_id` holds | `name` |
 | `counters` | running totals: `queries_total`, `log_dropped`, `log_late` | (small) |
 
 Conventions in the views:

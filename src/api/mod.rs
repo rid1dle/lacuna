@@ -839,7 +839,7 @@ mod tests {
         };
         assert_eq!(
             ids(&m["schema"], "name"),
-            ["queries", "hourly", "daily", "devices", "lists", "rules", "counters"]
+            ["queries", "hourly", "daily", "devices", "lists", "rules", "domains", "counters"]
         );
         assert!(m["schema"][0]["columns"][0]["type"].is_string());
         assert_eq!(ids(&m["variables"], "id"), ["client", "domain"]);
@@ -981,7 +981,9 @@ mod tests {
             "UPDATE client_names SET name = 'laptop', origin = 'config' WHERE ip = '{LAPTOP}';
              INSERT INTO list_meta (id, name, url, enabled, parsed, skipped_json, fetched_at)
              VALUES (1, '{LIST_NAME}', '{LIST_1_URL}', 1, 2, '{{}}', {END});
-             INSERT INTO rule_texts (list_id, text) VALUES (1, '||never.test^');"
+             INSERT INTO rule_texts (list_id, text) VALUES (1, '||never.test^');
+             INSERT INTO live_rules (id) SELECT id FROM rule_texts;
+             INSERT INTO rule_texts (list_id, text) VALUES (1, '||dropped.test^');"
         ))
         .unwrap();
         tx.commit().unwrap();
@@ -1253,6 +1255,80 @@ mod tests {
                     assert!(!scans_big(&steps), "{}: {steps:#?}", p.id);
                 }
             }
+        }
+        // A domain's lookups search its ids twice, for the cutoff and for the rows. (The
+        // plan says INDEX, not COVERING INDEX, but SQLite defers the row read and the
+        // cutoff needs only indexed columns.)
+        let m = manifest(2);
+        let lookups = m.dashboards.iter().flat_map(|d| &d.panels);
+        let lookups = lookups.clone().find(|p| p.id == "domain_lookups").unwrap();
+        let steps = plan(lookups.sql, &LONG);
+        let by_domain = steps
+            .iter()
+            .filter(|s| s.starts_with("SEARCH q USING INDEX raw_queries_domain_ts (domain_id=?"))
+            .count();
+        assert_eq!(by_domain, 2, "{steps:#?}");
+    }
+
+    /// domain_lookups returns the newest 500 matches of the name and its subdomains, for
+    /// a name with more than 500, a rare one, one device, and no name at all.
+    #[tokio::test]
+    async fn domain_lookups_are_the_newest_500() {
+        let r = rig("lookups", Setup::default());
+        let other = "192.168.0.20";
+        let mut records: Vec<QueryRecord> = (0..700)
+            .map(|i| {
+                record(
+                    END - DAY + i * MIN,
+                    [LAPTOP, other][i as usize % 2],
+                    "a.many.test",
+                )
+            })
+            .collect();
+        records.extend((0..3).map(|i| record(END - 2 * DAY + i, LAPTOP, "rare.test")));
+        // Newer than every match: a scan by time alone would fill 500 rows with these.
+        records.extend((0..600).map(|i| record(END - HOUR + i, LAPTOP, "noise.example")));
+        let mut conn = rusqlite::Connection::open(&r.db.0).unwrap();
+        let tx = conn.transaction().unwrap();
+        writer::insert_batch(&tx, &records, Source::Lacuna).unwrap();
+        tx.commit().unwrap();
+
+        let m = manifest(2);
+        let lookups = m.dashboards.iter().flat_map(|d| &d.panels);
+        let lookups = lookups.clone().find(|p| p.id == "domain_lookups").unwrap();
+        let month = Range {
+            from: END - 30 * DAY,
+            to: END,
+        };
+        let times = |frame: &Value| column(frame, "time");
+        for (domain, client, where_) in [
+            (Some("Many.Test"), None, "domain LIKE '%.many.test'"),
+            (
+                Some("many.test"),
+                Some(LAPTOP),
+                "domain LIKE '%.many.test' AND client = :client",
+            ),
+            (Some("rare.test"), None, "domain = 'rare.test'"),
+            (None, None, "1"),
+            (Some("absent.test"), None, "0"),
+        ] {
+            let (status, got) = r.query(lookups.sql, params(&month, client, domain)).await;
+            assert_eq!(status, StatusCode::OK, "{got}");
+            let want_sql = format!(
+                "SELECT time FROM queries WHERE ts >= :from AND ts < :to AND {where_}
+                 AND (:client IS NULL OR client = :client) ORDER BY ts DESC LIMIT 500"
+            );
+            let (_, want) = r.query(&want_sql, params(&month, client, None)).await;
+            let ctx = format!("{domain:?} {client:?}");
+            assert_eq!(times(&got), times(&want), "{ctx}");
+            let n = times(&got).len();
+            let expected = match (domain, client) {
+                (Some("rare.test"), _) => 3,
+                (Some("absent.test"), _) => 0,
+                (Some(_), Some(_)) => 350,
+                _ => 500,
+            };
+            assert_eq!(n, expected, "{ctx}");
         }
     }
 

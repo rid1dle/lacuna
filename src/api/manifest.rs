@@ -249,7 +249,7 @@ fn schema() -> Vec<View> {
             name: "queries",
             kind: "view",
             description: "Every query handled, kept 30 days. Bound it by ts, \
-                          or by client with ts, which are indexed.",
+                          by client with ts, or by domain_id with ts, which are indexed.",
             columns: vec![
                 col("ts", "integer", "When the query arrived, unix ms UTC"),
                 col("time", "text", "ts as ISO 8601 UTC text"),
@@ -300,6 +300,11 @@ fn schema() -> Vec<View> {
                 col("latency_ms", "real", "Time to answer, milliseconds"),
                 col("answers", "text", "A/AAAA addresses sent, comma separated"),
                 col("source", "text", "lacuna, or adguard for imported history"),
+                col(
+                    "domain_id",
+                    "integer",
+                    "Id of the name asked for; see domains",
+                ),
             ],
         },
         View {
@@ -404,13 +409,28 @@ fn schema() -> Vec<View> {
         View {
             name: "rules",
             kind: "view",
-            description: "Rule texts of every list that has been loaded, and user rules \
-                          that have decided a query.",
+            description: "Every rule text ever loaded from a list or the config. live \
+                          tells the rules in force now from ones since dropped.",
             columns: vec![
                 col("id", "integer", "Rule id"),
                 col("list_id", "integer", "List id; 0 is the user rules"),
                 col("list", "text", "List name"),
                 col("text", "text", "The rule as written"),
+                col(
+                    "live",
+                    "integer",
+                    "1 while the rule is in the running rule set, else 0",
+                ),
+            ],
+        },
+        View {
+            name: "domains",
+            kind: "view",
+            description: "Every name ever asked for, with its id. Look up a name's \
+                          domain_id here, then bound queries by domain_id with ts.",
+            columns: vec![
+                col("id", "integer", "Domain id, as queries.domain_id"),
+                col("name", "text", "Name, lowercase, no trailing dot"),
             ],
         },
         View {
@@ -861,16 +881,44 @@ LIMIT 20"
 
 // The chosen domain and its subdomains, newest first; with no domain, every lookup.
 // Raw rows only.
+// Two branches, one of which is empty. With no domain, the newest rows by ts. With one,
+// its ids (the name and its subdomains) first; `floor` is the 500th newest match, found
+// in the (domain_id, ts, client) index without reading a row, so only the rows shown are
+// fetched. A rare name no longer scans the whole range, and a common one no longer reads
+// all its matches. Measured on 1.9M synthetic rows: worst case 790 ms before, 170 ms now.
 const DOMAIN_LOOKUPS: &str = "\
+WITH ids AS MATERIALIZED (
+  SELECT id FROM domains
+  WHERE name = lower(:domain)
+     OR substr(name, -length(:domain) - 1) = '.' || lower(:domain)
+),
+floor AS (
+  SELECT ts FROM queries
+  WHERE domain_id IN ids AND ts >= :from AND ts < :to
+    AND (:client IS NULL OR client = :client)
+  ORDER BY ts DESC
+  LIMIT 1 OFFSET 499
+)
 SELECT time, device, domain, type, outcome, rule, list, answers, served_from, latency_ms
-FROM queries
-WHERE ts >= :from AND ts < :to
-  AND (:client IS NULL OR client = :client)
-  AND (:domain IS NULL
-       OR domain = lower(:domain)
-       OR substr(domain, -length(:domain) - 1) = '.' || lower(:domain))
-ORDER BY ts DESC
-LIMIT 500";
+FROM (
+  SELECT * FROM (
+    SELECT * FROM queries
+    WHERE :domain IS NULL AND ts >= :from AND ts < :to
+      AND (:client IS NULL OR client = :client)
+    ORDER BY ts DESC
+    LIMIT 500
+  )
+  UNION ALL
+  SELECT * FROM (
+    SELECT * FROM queries
+    WHERE domain_id IN ids
+      AND ts >= max(:from, coalesce((SELECT ts FROM floor), :from)) AND ts < :to
+      AND (:client IS NULL OR client = :client)
+    ORDER BY ts DESC
+    LIMIT 500
+  )
+)
+ORDER BY ts DESC";
 
 // Not tied to the time range or a device.
 const LISTS_TABLE: &str = "\
@@ -912,7 +960,8 @@ FROM (
     "))
 SELECT r.list, r.text AS rule
 FROM rules r
-WHERE NOT EXISTS (SELECT 1 FROM hit h WHERE h.list_id = r.list_id AND h.rule = r.text)
+WHERE r.live = 1
+  AND NOT EXISTS (SELECT 1 FROM hit h WHERE h.list_id = r.list_id AND h.rule = r.text)
 ORDER BY r.list_id, r.id
 LIMIT 500"
 );

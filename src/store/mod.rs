@@ -18,6 +18,8 @@ use crate::codes::{Outcome, Reason, ServedFrom, Source};
 /// The schema version this build creates and understands.
 const SCHEMA_VERSION: i64 = 1;
 const TABLES_SQL: &str = include_str!("schema.sql");
+/// Objects added within version 1, created at every open (IF NOT EXISTS).
+const ADDITIONS_SQL: &str = include_str!("additions.sql");
 const VIEWS_TEMPLATE: &str = include_str!("views.sql");
 
 /// Counter names in `counter_values`. Each exists from the first open, at 0.
@@ -168,8 +170,8 @@ pub fn rule_text(db: &Path, id: u32) -> Result<Option<String>> {
 }
 
 /// No `meta` table: a new database, so create the tables. Version 1: keep them. Anything
-/// else is refused rather than written to. Then, on every open, the views are rebuilt
-/// from this build's enums and every counter is made to exist.
+/// else is refused rather than written to. Then, on every open, additions.sql is applied,
+/// the views are rebuilt from this build's enums and every counter is made to exist.
 fn migrate(conn: &mut Connection) -> Result<()> {
     // IMMEDIATE takes the write lock before reading the version, so two processes
     // opening a new file cannot both create the schema.
@@ -198,6 +200,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             other => bail!("not a lacuna database: meta.schema_version is {other:?}"),
         }
     }
+
+    // Before the views, which read live_rules.
+    tx.execute_batch(ADDITIONS_SQL)?;
 
     let views: Vec<String> = tx
         .prepare("SELECT name FROM sqlite_master WHERE type = 'view'")?
@@ -481,6 +486,7 @@ mod tests {
                     "latency_ms",
                     "answers",
                     "source",
+                    "domain_id",
                 ],
             ),
             (
@@ -524,7 +530,8 @@ mod tests {
                     "last_error",
                 ],
             ),
-            ("rules", &["id", "list_id", "list", "text"]),
+            ("rules", &["id", "list_id", "list", "text", "live"]),
+            ("domains", &["id", "name"]),
             ("counters", &["name", "value"]),
         ];
         for &(view, columns) in contract {
@@ -552,6 +559,7 @@ mod tests {
         for sql in [
             "SELECT * FROM queries WHERE ts >= 1",
             "SELECT * FROM queries WHERE client = '10.0.0.1' AND ts >= 1",
+            "SELECT * FROM queries WHERE domain_id = 7 AND ts >= 1",
             "SELECT * FROM hourly WHERE hour_ts >= 1",
             "SELECT * FROM daily WHERE day_ts >= 1",
         ] {
@@ -719,7 +727,11 @@ mod tests {
     /// Day length and the IST offset come from the Rust constants, never typed into SQL.
     #[test]
     fn templates_have_no_time_literals() {
-        for (file, text) in [("schema.sql", TABLES_SQL), ("views.sql", VIEWS_TEMPLATE)] {
+        for (file, text) in [
+            ("schema.sql", TABLES_SQL),
+            ("additions.sql", ADDITIONS_SQL),
+            ("views.sql", VIEWS_TEMPLATE),
+        ] {
             for literal in ["86400", "19800", "3600"] {
                 assert!(!text.contains(literal), "{file} contains {literal}");
             }
@@ -743,7 +755,10 @@ mod tests {
             assert_eq!(cache, -4096);
             store
                 .conn
-                .execute("INSERT INTO domain_names(name) VALUES ('kept.example')", [])
+                .execute_batch(
+                    "INSERT INTO domain_names(name) VALUES ('kept.example');
+                     DROP INDEX raw_queries_domain_ts; DROP TABLE live_rules;",
+                )
                 .unwrap();
         }
         {
@@ -753,6 +768,17 @@ mod tests {
                 .query_row("SELECT count(*) FROM domain_names", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(n, 1, "reopening must not recreate the schema");
+            // A database from before additions.sql gets them at its next open.
+            let objects: i64 = store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE name IN ('raw_queries_domain_ts', 'live_rules')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(objects, 2);
             let version: i64 = store
                 .conn
                 .query_row(

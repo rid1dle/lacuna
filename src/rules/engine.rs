@@ -366,6 +366,18 @@ impl RuleSet {
         Ok(())
     }
 
+    /// The `rule_texts` ids of every rule in the set, sorted, each once. None for a set
+    /// that keeps its texts in memory, whose rules have no ids.
+    pub fn stored_ids(&self) -> Option<Vec<u32>> {
+        if self.texts.is_some() {
+            return None;
+        }
+        let mut ids: Vec<u32> = self.origins.iter().map(|o| o.rule).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
+    }
+
     pub fn rule_count(&self) -> usize {
         self.count
     }
@@ -943,5 +955,28 @@ mod tests {
         ] {
             assert_eq!(id_of(name), ids.ids[&(list_id, rule.to_string())], "{name}");
         }
+    }
+
+    /// The live ids are the set's rules, each once: a duplicate line counts once and a
+    /// rule a badfilter cancels is not in force. A set keeping texts has none.
+    #[test]
+    fn stored_ids_name_the_rules_in_force() {
+        let mut ids = MapIds::default();
+        let body = "||a.com^\n||b.com^\n||a.com^\n||c.com^\n||c.com^$badfilter";
+        let Ok((set, _)) = RuleSet::build_with(&["||u.com^".to_string()], &[(1, body)], &mut ids);
+        let mut want: Vec<u32> = ["||a.com^", "||b.com^"]
+            .iter()
+            .map(|t| ids.ids[&(1, t.to_string())])
+            .chain([ids.ids[&(0, "||u.com^".to_string())]])
+            .collect();
+        want.sort_unstable();
+        assert_eq!(set.stored_ids(), Some(want));
+        assert!(
+            !ids.ids.contains_key(&(1, "||c.com^".to_string())),
+            "cancelled, never stored"
+        );
+
+        let (in_memory, _) = RuleSet::build(&[], &[(1, body)]);
+        assert_eq!(in_memory.stored_ids(), None);
     }
 }

@@ -7,8 +7,9 @@
 --
 -- Conventions:
 -- * Every unix millisecond column ends in _ts.
--- * Indexed filters: queries.ts, queries.client with queries.ts, hourly.hour_ts and
---   daily.day_ts. Bound a query by one of these; other filters scan within that range.
+-- * Indexed filters: queries.ts, queries.client with queries.ts, queries.domain_id with
+--   queries.ts, hourly.hour_ts and daily.day_ts. Bound a query by one of these; other
+--   filters scan within that range. Find a name's domain_ids in domains.
 -- * device and list are live joins on client_names and list_meta, looked up at query
 --   time: renaming a device or a list relabels its history.
 -- * list_id 0 is the user rules from config.toml, named 'user rules'.
@@ -36,7 +37,8 @@ SELECT
     q.upstream,
     q.latency_us / 1000.0 AS latency_ms,
     q.answers,
-    {source_label} AS source
+    {source_label} AS source,
+    q.domain_id
 FROM raw_queries q
 LEFT JOIN domain_names d ON d.id = q.domain_id
 LEFT JOIN client_names c ON c.ip = q.client
@@ -85,10 +87,16 @@ CREATE VIEW lists AS
 SELECT id, name, url, enabled, parsed, skipped_json, fetched_at AS fetched_ts, last_error
 FROM list_meta;
 
+-- live: 1 while the rule is in the running rule set, 0 once its list or the config
+-- dropped it. Old rules stay so history keeps naming them.
 CREATE VIEW rules AS
-SELECT r.id, r.list_id, {list_name} AS list, r.text
+SELECT r.id, r.list_id, {list_name} AS list, r.text,
+       EXISTS (SELECT 1 FROM live_rules lr WHERE lr.id = r.id) AS live
 FROM rule_texts r
 LEFT JOIN list_meta l ON l.id = r.list_id;
+
+CREATE VIEW domains AS
+SELECT id, name FROM domain_names;
 
 CREATE VIEW counters AS
 SELECT name, value FROM counter_values;

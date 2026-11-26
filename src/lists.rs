@@ -289,7 +289,7 @@ impl<F: Fetch> Lists<F> {
         // Without this, `list_meta` keeps the counts of the old build until a refresh
         // finds a changed body.
         self.store_stats(&stats).await;
-        self.swap(set, stats);
+        self.install(set, stats).await;
         Ok(fresh)
     }
 
@@ -360,7 +360,7 @@ impl<F: Fetch> Lists<F> {
             lists = stats.len() - 1,
             "last good lists loaded"
         );
-        self.swap(set, stats);
+        self.install(set, stats).await;
         Ok(())
     }
 
@@ -430,7 +430,7 @@ impl<F: Fetch> Lists<F> {
                         },
                     })
                     .collect();
-                self.swap(set, stats);
+                self.install(set, stats).await;
                 RefreshReport {
                     per_list,
                     swapped: true,
@@ -511,6 +511,27 @@ impl<F: Fetch> Lists<F> {
         })
         .await
         .context("rebuilding the rule set")
+    }
+
+    /// Makes `set` the live set, then records its rule ids in `live_rules` for the views.
+    /// A set built without the store has no ids: the table then keeps the last ids
+    /// recorded, the closest thing known to what is in force.
+    async fn install(&self, set: RuleSet, stats: Vec<ListStats>) {
+        let ids = set.stored_ids().filter(|_| self.texts_in_db);
+        self.swap(set, stats);
+        let Some(ids) = ids else { return };
+        self.db_run("live rule ids", move |conn| {
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM live_rules", [])?;
+            {
+                let mut put = tx.prepare("INSERT INTO live_rules (id) VALUES (?1)")?;
+                for id in ids {
+                    put.execute([id])?;
+                }
+            }
+            tx.commit()
+        })
+        .await;
     }
 
     fn swap(&self, set: RuleSet, stats: Vec<ListStats>) {
@@ -907,6 +928,46 @@ mod tests {
             Some(1)
         );
         assert!(r.blocks("adnet.com"));
+    }
+
+    /// live_rules holds the running set's ids: a rule dropped from its list's body or
+    /// from the config's user rules leaves it, while rule_texts keeps it for history.
+    #[tokio::test]
+    async fn live_rules_follow_the_running_set() {
+        let r = rig("live");
+        let live = |text: &str| {
+            r.sql::<i64>(&format!(
+                "SELECT count(*) FROM live_rules l JOIN rule_texts t ON t.id = l.id
+                 WHERE t.text = '{text}'"
+            ))
+        };
+        r.fetch.set(URL1, Ok("||adnet.com^\n||ads.net^\n"));
+        assert!(r.lists.refresh().await.swapped);
+        assert_eq!(r.sql::<i64>("SELECT count(*) FROM live_rules"), Some(3));
+        for text in ["||adnet.com^", "||ads.net^", "||user-blocked.test^"] {
+            assert_eq!(live(text), Some(1), "{text}");
+        }
+
+        r.fetch.set(URL1, Ok("||adnet.com^\n||new.net^\n"));
+        assert!(r.lists.refresh().await.swapped);
+        assert_eq!(live("||ads.net^"), Some(0), "dropped from the list");
+        assert_eq!(
+            r.sql::<i64>("SELECT count(*) FROM rule_texts WHERE text = '||ads.net^'"),
+            Some(1),
+            "history keeps its text"
+        );
+        assert_eq!(live("||new.net^"), Some(1));
+
+        r.lists
+            .set_config(vec![cfg(1, "First", URL1, true)], vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            live("||user-blocked.test^"),
+            Some(0),
+            "dropped from the config"
+        );
+        assert_eq!(r.sql::<i64>("SELECT count(*) FROM live_rules"), Some(2));
     }
 
     #[tokio::test]
