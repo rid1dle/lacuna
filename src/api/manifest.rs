@@ -33,6 +33,32 @@ pub struct Manifest {
     pub variables: Vec<Variable>,
     pub dashboards: Vec<Dashboard>,
     pub actions: Vec<Action>,
+    /// Checks the consumer runs on a schedule (CONTRACT.md, Watches).
+    pub watches: Vec<Watch>,
+}
+
+/// A check run every `every_seconds` with `:from` (the last run) and `:to` (now). Each
+/// row is an event named by its `key` column; the consumer reports keys it hasn't seen
+/// before, with `message` filled from the row's columns (`{device}`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Watch {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub every_seconds: u32,
+    pub sql: &'static str,
+    pub message: &'static str,
+    /// The dashboard to open from the notice.
+    pub dashboard: &'static str,
+}
+
+/// A value that means something on a panel's scale (CONTRACT.md, Panel options).
+#[derive(Debug, Serialize)]
+pub struct Threshold {
+    pub value: f64,
+    /// "ok", "warn" or "bad".
+    pub tone: &'static str,
+    pub label: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,7 +105,7 @@ pub struct Dashboard {
 pub struct Panel {
     pub id: &'static str,
     pub title: &'static str,
-    /// "stat", "timeseries", "bar", "table" or "log".
+    /// "stat", "timeseries", "bar", "table", "log" or "heatmap".
     pub kind: &'static str,
     pub sql: &'static str,
     pub layout: Layout,
@@ -109,6 +135,10 @@ pub struct Options {
     pub label: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_seconds: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub thresholds: Vec<Threshold>,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,6 +223,7 @@ pub fn manifest(max_concurrent: usize) -> Manifest {
             },
         ],
         dashboards: dashboards(),
+        watches: watches(),
         actions: vec![
             Action {
                 id: ActionId::Pause.id(),
@@ -703,6 +734,136 @@ fn dashboards() -> Vec<Dashboard> {
                 },
             ],
         },
+        Dashboard {
+            id: "tuner",
+            title: "Blocklist tuner",
+            variables: vec!["client"],
+            panels: vec![
+                Panel {
+                    id: "list_use",
+                    title: "How much of each list is used (whole days)",
+                    kind: "table",
+                    sql: LIST_USE,
+                    layout: at(0, 0, 12, 6),
+                    options: Options::default(),
+                },
+                Panel {
+                    id: "tuner_retries",
+                    title: "Blocked names asked over and over (last 7 days at most)",
+                    kind: "table",
+                    sql: BLOCKED_RETRIES,
+                    layout: at(0, 6, 12, 8),
+                    options: Options::default(),
+                },
+                Panel {
+                    id: "tuner_top_rules",
+                    title: "Rules that block the most",
+                    kind: "bar",
+                    sql: TOP_RULES,
+                    layout: at(0, 14, 6, 10),
+                    options: bar("rule", "n", None),
+                },
+                Panel {
+                    id: "tuner_never_hit",
+                    title: "Live rules that blocked nothing",
+                    kind: "table",
+                    sql: NEVER_HIT,
+                    layout: at(6, 14, 6, 10),
+                    options: Options::default(),
+                },
+            ],
+        },
+        Dashboard {
+            id: "report",
+            title: "Internet report card",
+            variables: vec![],
+            panels: vec![
+                Panel {
+                    id: "outage_minutes",
+                    title: "Minutes the internet failed (last 7 days at most)",
+                    kind: "stat",
+                    sql: OUTAGE_MINUTES,
+                    layout: at(0, 0, 4, 4),
+                    options: Options {
+                        unit: Some(" min"),
+                        thresholds: vec![
+                            Threshold { value: 5.0, tone: "warn", label: "Some trouble" },
+                            Threshold { value: 30.0, tone: "bad", label: "Bad week" },
+                        ],
+                        ..stat("minutes")
+                    },
+                },
+                Panel {
+                    id: "report_cache",
+                    title: "Answered without the internet (last 7 days at most)",
+                    kind: "stat",
+                    sql: CACHE_HIT_RATE,
+                    layout: at(4, 0, 4, 4),
+                    options: stat("cache_hit_pct"),
+                },
+                Panel {
+                    id: "report_latency",
+                    title: "Upstream latency, ms (last 7 days at most)",
+                    kind: "timeseries",
+                    sql: UPSTREAM_LATENCY,
+                    layout: at(8, 0, 4, 4),
+                    options: timeseries("ts", "avg_ms", None),
+                },
+                Panel {
+                    id: "failure_heat",
+                    title: "When the internet failed, by hour (IST, last 7 days at most)",
+                    kind: "heatmap",
+                    sql: FAILURE_HEAT,
+                    layout: at(0, 4, 12, 7),
+                    options: Options { x: Some("hour"), series: Some("day"), y: Some("n"), ..Options::default() },
+                },
+                Panel {
+                    id: "lookup_heat",
+                    title: "Lookups by hour (IST)",
+                    kind: "heatmap",
+                    sql: LOOKUP_HEAT,
+                    layout: at(0, 11, 12, 9),
+                    options: Options { x: Some("hour"), series: Some("day"), y: Some("n"), unit: Some(" lookups"), ..Options::default() },
+                },
+                Panel {
+                    id: "worst_days",
+                    title: "Worst days for failed lookups (last 7 days at most)",
+                    kind: "table",
+                    sql: WORST_DAYS,
+                    layout: at(0, 20, 12, 6),
+                    options: Options::default(),
+                },
+            ],
+        },
+    ]
+}
+
+fn watches() -> Vec<Watch> {
+    vec![
+        Watch {
+            id: "new_device",
+            title: "A new device on the network",
+            every_seconds: 300,
+            sql: WATCH_NEW_DEVICE,
+            message: "{device} asked its first lookup on the network.",
+            dashboard: "devices",
+        },
+        Watch {
+            id: "timed_caller",
+            title: "A device calling home on a timer",
+            every_seconds: 3600,
+            sql: WATCH_TIMED_CALLER,
+            message: "{device} asked {domain} {n} times in 6 hours, in every one of those hours.",
+            dashboard: "background",
+        },
+        Watch {
+            id: "internet_trouble",
+            title: "Internet trouble",
+            every_seconds: 300,
+            sql: WATCH_NET_TROUBLE,
+            message: "In the hour from {at_ist} IST, {n} lookups from {devices} devices failed: lacuna couldn't reach the internet.",
+            dashboard: "health",
+        },
     ]
 }
 
@@ -1139,3 +1300,105 @@ WHERE ts >= :from AND ts < :to
   AND (:client IS NULL OR client = :client)
 ORDER BY ts DESC
 LIMIT 200";
+
+// ---- Blocklist tuner
+
+// Per list: its live rules, how many of them blocked something in the range, and how
+// often. Whole days from the rollup only (today's partial day is not in it yet).
+const LIST_USE: &str = "\
+WITH live AS (
+  SELECT list_id, list, count(*) AS rules FROM rules WHERE live = 1 GROUP BY list_id
+), used AS (
+  SELECT list_id, count(DISTINCT rule) AS used, sum(n) AS blocks
+  FROM daily
+  WHERE day_ts >= :from - 86400000 AND day_ts < :to AND outcome = 'blocked' AND rule IS NOT NULL
+  GROUP BY list_id
+)
+SELECT live.list, live.rules, coalesce(used.used, 0) AS rules_used,
+       round(100.0 * coalesce(used.used, 0) / live.rules, 2) AS used_pct,
+       coalesce(used.blocks, 0) AS blocks
+FROM live LEFT JOIN used ON used.list_id = live.list_id
+ORDER BY used_pct";
+
+// ---- Internet report card
+
+// Minutes in which lookups from two or more devices failed because no upstream answered.
+const OUTAGE_MINUTES: &str = "\
+SELECT count(*) AS minutes FROM (
+  SELECT ts / 60000 AS m
+  FROM queries
+  WHERE ts >= max(:from, :to - 604800000) AND ts < :to
+    AND rcode = 'SERVFAIL' AND upstream IS NULL
+  GROUP BY m
+  HAVING count(DISTINCT client) >= 2
+)";
+
+const FAILURE_HEAT: &str = "\
+SELECT CAST(strftime('%H', (ts + 19800000) / 1000, 'unixepoch') AS INTEGER) AS hour,
+       substr('SunMonTueWedThuFriSat', 1 + 3 * strftime('%w', (ts + 19800000) / 1000, 'unixepoch'), 3)
+         || strftime(' %d', (ts + 19800000) / 1000, 'unixepoch') AS day,
+       count(*) AS n
+FROM queries
+WHERE ts >= max(:from, :to - 604800000) AND ts < :to
+  AND rcode = 'SERVFAIL' AND upstream IS NULL
+GROUP BY day, hour
+ORDER BY min(ts)";
+
+// From the hourly rollup, so a whole month is cheap.
+const LOOKUP_HEAT: &str = "\
+SELECT CAST(strftime('%H', (hour_ts + 19800000) / 1000, 'unixepoch') AS INTEGER) AS hour,
+       substr('SunMonTueWedThuFriSat', 1 + 3 * strftime('%w', (hour_ts + 19800000) / 1000, 'unixepoch'), 3)
+         || strftime(' %d', (hour_ts + 19800000) / 1000, 'unixepoch') AS day,
+       sum(n) AS n
+FROM hourly
+WHERE hour_ts >= :from AND hour_ts < :to
+GROUP BY day, hour
+ORDER BY min(hour_ts)";
+
+const WORST_DAYS: &str = "\
+SELECT strftime('%Y-%m-%d', (ts + 19800000) / 1000, 'unixepoch') AS day,
+       sum(upstream IS NULL) AS no_upstream, sum(upstream IS NOT NULL) AS name_failed,
+       count(DISTINCT client) AS devices
+FROM queries
+WHERE ts >= max(:from, :to - 604800000) AND ts < :to
+  AND rcode = 'SERVFAIL'
+GROUP BY day
+ORDER BY no_upstream DESC, name_failed DESC
+LIMIT 10";
+
+// ---- Watches: each row is an event named by `key` (CONTRACT.md, Watches)
+
+const WATCH_NEW_DEVICE: &str = "\
+SELECT client AS key, device
+FROM devices
+WHERE first_seen_ts >= :from AND first_seen_ts < :to
+  AND instr(client, ':') = 0
+ORDER BY first_seen_ts
+LIMIT 20";
+
+// The same device and name in each of the last 6 hours, 24 times or more.
+const WATCH_TIMED_CALLER: &str = "\
+SELECT client || ' ' || domain AS key, device, domain, count(*) AS n
+FROM queries
+WHERE ts >= :to - 21600000 AND ts < :to
+GROUP BY client, domain
+HAVING count(*) >= 24 AND count(DISTINCT ts / 3600000) >= 6
+ORDER BY n DESC
+LIMIT 200";
+
+// No "new name at night" watch: tried on 26 Nov, most such names are machine-made and
+// change all the time (Bonjour reverse lookups, video cache shards like rr5---sn-...),
+// so it would report noise every night.
+
+// An hour in which 30 or more lookups from 3 or more devices failed because no
+// upstream answered. Per hour, so one outage is one notice; on 26 Nov this picked 4
+// hours in 7 days, where 2 devices and 10 failures picked 14.
+const WATCH_NET_TROUBLE: &str = "\
+SELECT CAST(ts - ts % 3600000 AS TEXT) AS key,
+       strftime('%H:00', (ts - ts % 3600000 + 19800000) / 1000, 'unixepoch') AS at_ist,
+       count(*) AS n, count(DISTINCT client) AS devices
+FROM queries
+WHERE ts >= :to - 3600000 - :to % 3600000 AND ts < :to
+  AND rcode = 'SERVFAIL' AND upstream IS NULL
+GROUP BY ts - ts % 3600000
+HAVING count(*) >= 30 AND count(DISTINCT client) >= 3";

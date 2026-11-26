@@ -188,10 +188,10 @@ A dashboard's `variables` lists the ids it shows pickers for.
 
 | Field | Meaning |
 |---|---|
-| `id` | Stable id. Dashboard ids: `overview`, `devices`, `domains`, `rules`, `live`, `background`, `health` |
+| `id` | Stable id. Dashboard ids: `overview`, `devices`, `domains`, `rules`, `live`, `background`, `health`, `tuner`, `report` |
 | `title` | For people |
 | `variables` | Variable ids to show pickers for |
-| `panels[].kind` | `stat`, `timeseries`, `bar`, `table` or `log` |
+| `panels[].kind` | `stat`, `timeseries`, `bar`, `table`, `log` or `heatmap` |
 | `panels[].sql` | One read-only statement, run through `/integration/query` |
 | `panels[].layout` | `{ x, y, w, h }` on a 12-column grid; `x + w <= 12`; `h` is in rows of the consumer's choosing |
 | `panels[].options` | Which result columns play which role (below) |
@@ -205,9 +205,42 @@ Option roles, each naming a result column (absent roles are not set):
 | `bar` | `label`, `y`, `series` (optional) | One bar per `label`; `series` splits each bar |
 | `table` | none | Every column, in order |
 | `log` | none | Every column, newest rows first, as lacuna returns them |
+| `heatmap` | `x`, `series`, `y` | One cell per (`series`, `x`) pair, shaded by `y`; a missing pair is "no data", not 0 |
 
 Any kind may also carry `refreshSeconds`: redraw that often while the page is open.
 In version 1 only `live.recent` sets it (5).
+
+Drawing options, all optional (added without a version bump; a consumer that doesn't know
+one ignores it): `unit` (printed after values, e.g. `" min"`), `decimals`, `colors`
+(series name to palette slot `s0` to `s5`), `thresholds` (`[{ value, tone, label }]`,
+tone `ok`, `warn` or `bad`: a stat takes the tone of the highest one it reaches; a time
+series draws them as reference lines), `legend` (false hides it), `yMin`, `yMax`.
+lacuna sets `unit` and `thresholds` on `report.outage_minutes`.
+
+### watches
+
+Checks a consumer runs on a schedule and reports from:
+
+| Field | Meaning |
+|---|---|
+| `id`, `title` | Stable id; a title for people |
+| `everySeconds` | How often to run it |
+| `sql` | Run with `:from` = the previous run's `:to` and `:to` = now (unix ms) |
+| `message` | Filled from the row's columns by name: `{device}` |
+| `dashboard` | The dashboard id to open from a notice |
+
+Each row is an event named by its `key` column. A consumer reports keys it has not seen
+before for that watch, and on a watch's first run records the keys without reporting
+them (a first run would otherwise report every device the house has).
+
+| Watch | Event |
+|---|---|
+| `new_device` | An IPv4 address asked its first lookup |
+| `timed_caller` | A device asked one name 24 times or more in 6 hours, in each of those hours |
+| `internet_trouble` | An hour with 30 or more lookups from 3 or more devices failing for want of an upstream |
+
+There is no "new name" watch: names new to the house, even at night, are mostly
+machine-made (service discovery, video cache shards) and change constantly.
 
 Default panels count exactly the queries in `[from, to)`. Up to 24 hours they read the
 raw `queries` view (5-minute buckets for time series). Longer ranges read the `hourly`

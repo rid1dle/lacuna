@@ -880,6 +880,14 @@ mod tests {
                 "health",
                 &["failures", "failing_names", "upstreams", "answered_from"],
             ),
+            (
+                "tuner",
+                &["list_use", "tuner_retries", "tuner_top_rules", "tuner_never_hit"],
+            ),
+            (
+                "report",
+                &["outage_minutes", "report_cache", "report_latency", "failure_heat", "lookup_heat", "worst_days"],
+            ),
         ];
         let want: Vec<(String, Vec<String>)> = want
             .iter()
@@ -890,7 +898,18 @@ mod tests {
         let recent = &dashboards[4]["panels"][0];
         assert_eq!(recent["kind"], "log");
         assert_eq!(recent["options"]["refreshSeconds"], 5);
-        let kinds = ["stat", "timeseries", "bar", "table", "log"];
+        let kinds = ["stat", "timeseries", "bar", "table", "log", "heatmap"];
+        // Drawing options and watches reach the JSON in the contract's names.
+        let outage = &dashboards[8]["panels"][0];
+        assert_eq!(outage["options"]["unit"], " min");
+        assert_eq!(outage["options"]["thresholds"][1], json!({"value": 30.0, "tone": "bad", "label": "Bad week"}));
+        let watch_ids: Vec<&str> = m["watches"].as_array().unwrap().iter().map(|w| w["id"].as_str().unwrap()).collect();
+        assert_eq!(watch_ids, ["new_device", "timed_caller", "internet_trouble"]);
+        for w in m["watches"].as_array().unwrap() {
+            assert!(w["everySeconds"].as_u64().unwrap() >= 60, "{w}");
+            let board = w["dashboard"].as_str().unwrap();
+            assert!(dashboards.iter().any(|d| d["id"] == board), "{w}");
+        }
         for d in dashboards {
             for p in d["panels"].as_array().unwrap() {
                 assert!(kinds.contains(&p["kind"].as_str().unwrap()), "{p}");
@@ -1259,6 +1278,13 @@ mod tests {
                     let steps = plan(p.sql, range);
                     assert!(!scans_big(&steps), "{}: {steps:#?}", p.id);
                 }
+            }
+        }
+        // Watches run in the background all day: the same rule.
+        for w in manifest(2).watches {
+            for range in [&SHORT, &LONG] {
+                let steps = plan(w.sql, range);
+                assert!(!scans_big(&steps), "watch {}: {steps:#?}", w.id);
             }
         }
         // A domain's lookups search its ids twice, for the cutoff and for the rows. (The
