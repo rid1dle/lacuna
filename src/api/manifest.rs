@@ -633,6 +633,76 @@ fn dashboards() -> Vec<Dashboard> {
                 },
             }],
         },
+        Dashboard {
+            id: "background",
+            title: "Background",
+            variables: vec!["client"],
+            panels: vec![
+                Panel {
+                    id: "pollers",
+                    title: "Steady pollers (last 24 hours at most)",
+                    kind: "table",
+                    sql: POLLERS,
+                    layout: at(0, 0, 12, 10),
+                    options: Options::default(),
+                },
+                Panel {
+                    id: "blocked_retries",
+                    title: "Blocked names asked again and again (last 7 days at most)",
+                    kind: "table",
+                    sql: BLOCKED_RETRIES,
+                    layout: at(0, 10, 6, 10),
+                    options: Options::default(),
+                },
+                Panel {
+                    id: "nxdomain",
+                    title: "Names that do not exist (last 7 days at most)",
+                    kind: "table",
+                    sql: NXDOMAIN,
+                    layout: at(6, 10, 6, 10),
+                    options: Options::default(),
+                },
+            ],
+        },
+        Dashboard {
+            id: "health",
+            title: "Internet health",
+            variables: vec![],
+            panels: vec![
+                Panel {
+                    id: "failures",
+                    title: "Failed lookups (last 7 days at most)",
+                    kind: "timeseries",
+                    sql: FAILURES,
+                    layout: at(0, 0, 12, 8),
+                    options: timeseries("ts", "n", Some("kind")),
+                },
+                Panel {
+                    id: "failing_names",
+                    title: "Names that fail to resolve (last 7 days at most)",
+                    kind: "table",
+                    sql: FAILING_NAMES,
+                    layout: at(0, 8, 6, 10),
+                    options: Options::default(),
+                },
+                Panel {
+                    id: "upstreams",
+                    title: "Upstreams: answers won and speed (last 7 days at most)",
+                    kind: "table",
+                    sql: UPSTREAMS,
+                    layout: at(6, 8, 6, 10),
+                    options: Options::default(),
+                },
+                Panel {
+                    id: "answered_from",
+                    title: "Where answers came from (last 7 days at most)",
+                    kind: "timeseries",
+                    sql: ANSWERED_FROM,
+                    layout: at(0, 18, 12, 8),
+                    options: timeseries("ts", "n", Some("served_from")),
+                },
+            ],
+        },
     ]
 }
 
@@ -965,6 +1035,102 @@ WHERE r.live = 1
 ORDER BY r.list_id, r.id
 LIMIT 500"
 );
+
+// Lookups each device repeats on a timer. The gap is to the same device's previous
+// lookup of the same name and type; gaps over an hour (a laptop asleep) are left out of
+// the typical interval. A window function over raw rows, so 24 hours at most.
+const POLLERS: &str = "\
+WITH gaps AS (
+  SELECT client, device, domain,
+         ts - lag(ts) OVER (PARTITION BY client, domain, type ORDER BY ts) AS gap
+  FROM queries
+  WHERE ts >= max(:from, :to - 86400000) AND ts < :to
+    AND (:client IS NULL OR client = :client)
+)
+SELECT device, domain, count(*) AS n,
+       round(avg(CASE WHEN gap < 3600000 THEN gap END) / 1000.0, 1) AS every_s
+FROM gaps
+GROUP BY client, domain
+HAVING count(*) >= 100
+ORDER BY n DESC
+LIMIT 50";
+
+// A block makes many apps retry; each retry after the blocked answer's TTL is a lookup.
+const BLOCKED_RETRIES: &str = "\
+SELECT device, domain, rule, count(*) AS n,
+       round(count(*) * 86400000.0 / (:to - max(:from, :to - 604800000)), 1) AS per_day
+FROM queries
+WHERE ts >= max(:from, :to - 604800000) AND ts < :to
+  AND outcome = 'blocked'
+  AND (:client IS NULL OR client = :client)
+GROUP BY client, domain
+HAVING count(*) >= 20
+ORDER BY n DESC
+LIMIT 50";
+
+const NXDOMAIN: &str = "\
+SELECT device, domain, count(*) AS n
+FROM queries
+WHERE ts >= max(:from, :to - 604800000) AND ts < :to
+  AND rcode = 'NXDOMAIN'
+  AND (:client IS NULL OR client = :client)
+GROUP BY client, domain
+ORDER BY n DESC
+LIMIT 50";
+
+// Two different failures: no upstream answered at all (the internet or the upstreams are
+// down), and an upstream that answered SERVFAIL for one name (that name is broken).
+const FAILURES: &str = "\
+SELECT
+  CASE
+    WHEN :to - :from <= 86400000 THEN ts - ts % 300000
+    WHEN :to - :from <= 604800000 THEN ts - ts % 3600000
+    ELSE ts - (ts + 19800000) % 86400000
+  END AS ts,
+  CASE WHEN upstream IS NULL THEN 'no upstream answered' ELSE 'name failed' END AS kind,
+  count(*) AS n
+FROM queries
+WHERE ts >= max(:from, :to - 604800000) AND ts < :to
+  AND rcode = 'SERVFAIL'
+GROUP BY 1, 2
+ORDER BY 1";
+
+const FAILING_NAMES: &str = "\
+SELECT domain, count(DISTINCT client) AS devices, count(*) AS n,
+       sum(upstream IS NULL) AS no_upstream, max(time) AS last
+FROM queries
+WHERE ts >= max(:from, :to - 604800000) AND ts < :to
+  AND rcode = 'SERVFAIL'
+GROUP BY domain
+ORDER BY n DESC
+LIMIT 50";
+
+// AdGuard's imported history names an upstream by URL, lacuna by host: one label each.
+const UPSTREAMS: &str = "\
+SELECT replace(replace(upstream, 'https://', ''), ':443/dns-query', '') AS upstream,
+       count(*) AS answers,
+       round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS share_pct,
+       round(avg(latency_ms), 1) AS avg_ms,
+       sum(latency_ms >= 1000) AS over_1s
+FROM queries
+WHERE ts >= max(:from, :to - 604800000) AND ts < :to
+  AND upstream IS NOT NULL
+GROUP BY 1
+ORDER BY answers DESC";
+
+const ANSWERED_FROM: &str = "\
+SELECT
+  CASE
+    WHEN :to - :from <= 86400000 THEN ts - ts % 300000
+    WHEN :to - :from <= 604800000 THEN ts - ts % 3600000
+    ELSE ts - (ts + 19800000) % 86400000
+  END AS ts,
+  served_from,
+  count(*) AS n
+FROM queries
+WHERE ts >= max(:from, :to - 604800000) AND ts < :to
+GROUP BY 1, 2
+ORDER BY 1";
 
 const RECENT: &str = "\
 SELECT ts, time, device, domain, type, outcome, rule, served_from, latency_ms

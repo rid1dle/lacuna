@@ -69,7 +69,7 @@ Authorization: Bearer 7f3c9a...
 ```
 
 Response `200`, abridged: the real one lists all eight views with every column, both
-variables, all five dashboards with every panel, and all five actions. Each part's
+variables, all seven dashboards with every panel, and all five actions. Each part's
 shape is shown in full once.
 
 ```json
@@ -188,7 +188,7 @@ A dashboard's `variables` lists the ids it shows pickers for.
 
 | Field | Meaning |
 |---|---|
-| `id` | Stable id. Dashboard ids: `overview`, `devices`, `domains`, `rules`, `live` |
+| `id` | Stable id. Dashboard ids: `overview`, `devices`, `domains`, `rules`, `live`, `background`, `health` |
 | `title` | For people |
 | `variables` | Variable ids to show pickers for |
 | `panels[].kind` | `stat`, `timeseries`, `bar`, `table` or `log` |

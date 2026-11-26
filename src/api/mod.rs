@@ -875,6 +875,11 @@ mod tests {
             ("domains", &["top_domains", "top_blocked", "domain_lookups"]),
             ("rules", &["lists_table", "top_rules", "never_hit"]),
             ("live", &["recent"]),
+            ("background", &["pollers", "blocked_retries", "nxdomain"]),
+            (
+                "health",
+                &["failures", "failing_names", "upstreams", "answered_from"],
+            ),
         ];
         let want: Vec<(String, Vec<String>)> = want
             .iter()
@@ -1332,6 +1337,156 @@ mod tests {
         }
     }
 
+    /// The Background and Internet health panels each find the case they are for.
+    #[tokio::test]
+    async fn background_and_health_panels_find_their_cases() {
+        let r = rig("background", Setup::default());
+        let other = "192.168.0.20";
+        let mut records: Vec<QueryRecord> = Vec::new();
+        // A poller: every 60 s for 3 hours, with a 2-hour sleep in the middle.
+        for i in 0..180 {
+            let sleep = if i >= 90 { 2 * HOUR } else { 0 };
+            records.push(record(
+                END - 6 * HOUR + i * MIN + sleep,
+                LAPTOP,
+                "poll.test",
+            ));
+        }
+        // A blocked name asked 30 times, and one asked 5 times (under the cutoff).
+        let blocked = |ts, name: &str| QueryRecord {
+            outcome: Outcome::Blocked,
+            reason: Reason::Rule,
+            list_id: Some(1),
+            rule: Some("||storm.test^".into()),
+            served_from: ServedFrom::Local,
+            ..record(ts, LAPTOP, name)
+        };
+        records.extend((0..30).map(|i| blocked(END - DAY + i * MIN, "storm.test")));
+        records.extend((0..5).map(|i| blocked(END - DAY + i * MIN, "x.storm.test")));
+        // Names that do not exist, a name an upstream failed, and lookups no upstream answered.
+        let rcode = |ts, client, name: &str, rcode, upstream: Option<&str>| QueryRecord {
+            rcode: Some(rcode),
+            served_from: ServedFrom::Upstream,
+            upstream: upstream.map(String::from),
+            ..record(ts, client, name)
+        };
+        records
+            .extend((0..4).map(|i| rcode(END - 2 * HOUR + i, other, "typo.test", 3, Some("doh"))));
+        records.extend(
+            (0..3).map(|i| rcode(END - 3 * HOUR + i, LAPTOP, "broken.test", 2, Some("doh"))),
+        );
+        records.extend((0..2).map(|i| rcode(END - 4 * HOUR + i, other, "down.test", 2, None)));
+        // Answers from two upstreams, one labelled the way AdGuard's history labels it.
+        let answered = |ts, upstream: &str, ms: u32| QueryRecord {
+            served_from: ServedFrom::Upstream,
+            upstream: Some(upstream.into()),
+            latency_us: ms * 1000,
+            ..record(ts, other, "up.test")
+        };
+        records.extend((0..6).map(|i| answered(END - 5 * HOUR + i, "cloudflare-dns.com", 10)));
+        records.extend((0..2).map(|i| {
+            answered(
+                END - 5 * HOUR + 10 + i,
+                "https://cloudflare-dns.com:443/dns-query",
+                30,
+            )
+        }));
+        records.push(answered(END - 5 * HOUR + 20, "dns10.quad9.net", 1500));
+        let mut conn = rusqlite::Connection::open(&r.db.0).unwrap();
+        let tx = conn.transaction().unwrap();
+        writer::insert_batch(&tx, &records, Source::Lacuna).unwrap();
+        tx.commit().unwrap();
+
+        let m = manifest(2);
+        let sql = |id: &str| {
+            m.dashboards
+                .iter()
+                .flat_map(|d| &d.panels)
+                .find(|p| p.id == id)
+                .unwrap()
+                .sql
+        };
+        let week = Range {
+            from: END - 7 * DAY,
+            to: END,
+        };
+        let run = |id: &'static str| {
+            let r = &r;
+            let p = params(&week, None, None);
+            async move {
+                let (status, frame) = r.query(sql(id), p).await;
+                assert_eq!(status, StatusCode::OK, "{id}: {frame}");
+                frame
+            }
+        };
+        let rows = |frame: &Value| frame["rows"].as_array().unwrap().clone();
+
+        // The poller: 180 lookups, every 60 s; the 2-hour sleep is not its interval.
+        let pollers = run("pollers").await;
+        assert_eq!(column(&pollers, "domain"), [json!("poll.test")]);
+        assert_eq!(column(&pollers, "n"), [json!(180)]);
+        assert_eq!(column(&pollers, "every_s"), [json!(60.0)]);
+
+        let retries = run("blocked_retries").await;
+        assert_eq!(
+            column(&retries, "domain"),
+            [json!("storm.test")],
+            "5 is under the cutoff"
+        );
+        assert_eq!(column(&retries, "n"), [json!(30)]);
+        assert_eq!(column(&retries, "per_day"), [json!(4.3)], "30 over 7 days");
+
+        let nx = run("nxdomain").await;
+        assert_eq!(rows(&nx), [json!([other, "typo.test", 4])]);
+
+        let failures = run("failures").await;
+        let mut kinds: Vec<(String, i64)> = rows(&failures)
+            .iter()
+            .map(|r| (r[1].as_str().unwrap().to_string(), r[2].as_i64().unwrap()))
+            .collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            [
+                ("name failed".to_string(), 3),
+                ("no upstream answered".to_string(), 2)
+            ]
+        );
+        let names = run("failing_names").await;
+        assert_eq!(
+            column(&names, "domain"),
+            [json!("broken.test"), json!("down.test")]
+        );
+        assert_eq!(column(&names, "no_upstream"), [json!(0), json!(2)]);
+
+        // Both labels of Cloudflare count as one upstream. 4 + 3 more answers name "doh".
+        let ups = run("upstreams").await;
+        let by: BTreeMap<String, (i64, f64, i64)> = rows(&ups)
+            .iter()
+            .map(|r| {
+                (
+                    r[0].as_str().unwrap().to_string(),
+                    (
+                        r[1].as_i64().unwrap(),
+                        r[3].as_f64().unwrap(),
+                        r[4].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(by["cloudflare-dns.com"].0, 8);
+        assert_eq!(
+            by["cloudflare-dns.com"].1, 15.0,
+            "6 at 10 ms and 2 at 30 ms"
+        );
+        assert_eq!(by["dns10.quad9.net"], (1, 1500.0, 1));
+        assert_eq!(by["doh"].0, 7);
+
+        let from = run("answered_from").await;
+        let total: i64 = column(&from, "n").iter().map(|v| v.as_i64().unwrap()).sum();
+        assert_eq!(total, records.len() as i64);
+    }
+
     #[tokio::test]
     async fn query_errors_are_400() {
         let _heavy = HEAVY_TEST.lock().await;
@@ -1586,10 +1741,11 @@ mod tests {
         // A good config applies everything a reload covers.
         let good = DEPLOY
             .replace("user_rules = []", "user_rules = [\"@@||adnet.com^\"]")
+            // The rewrite goes before [devices], whose entries would otherwise follow it.
             .replace(
                 "[devices]\n",
-                "[devices]\n\"192.168.0.99\" = \"tv\"\n\n\
-                 [[rewrites]]\nname = \"nas.lan\"\na = \"192.168.0.50\"\n",
+                "[[rewrites]]\nname = \"nas.lan\"\na = \"192.168.0.50\"\n\n\
+                 [devices]\n\"192.168.0.99\" = \"tv\"\n",
             );
         assert!(
             good.contains("nas.lan") && good.contains("@@"),
@@ -1607,7 +1763,10 @@ mod tests {
             "[api]",
             "[store]",
         ] {
-            assert!(message.contains(needs_restart), "{needs_restart}: {message}");
+            assert!(
+                message.contains(needs_restart),
+                "{needs_restart}: {message}"
+            );
         }
         assert_eq!(rewrites(), 3);
         let (_, verdict) = r.act("test_domain", json!({ "name": "nas.lan" })).await;
