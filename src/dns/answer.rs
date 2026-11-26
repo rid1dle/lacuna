@@ -3,8 +3,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use hickory_proto::op::{Edns, Message, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::{A, AAAA};
-use hickory_proto::rr::{RData, Record, RecordType};
+use hickory_proto::rr::rdata::{A, AAAA, SOA};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 
 use crate::config::Rewrite;
 
@@ -31,12 +31,39 @@ fn base(query: &Message, code: ResponseCode) -> Message {
 }
 
 /// A NOERROR response carrying at most one answer for the first question.
+///
+/// With no answer (NODATA) it carries a made-up SOA instead, whose TTL and minimum are
+/// `ttl`: RFC 2308 lets a resolver cache a NODATA only for the SOA's TTL, and without one
+/// it caches nothing. Measured: a blocked HTTPS record with no SOA was asked again every
+/// 90 s even with a 3600 s blocked TTL. AdGuard Home sends the same kind of SOA.
 fn with_answer(query: &Message, rdata: Option<RData>, ttl: u32) -> Message {
     let mut resp = base(query, ResponseCode::NoError);
-    if let (Some(rdata), Some(q)) = (rdata, query.queries.first()) {
-        resp.add_answer(Record::from_rdata(q.name().clone(), ttl, rdata));
+    let Some(q) = query.queries.first() else {
+        return resp;
+    };
+    match rdata {
+        Some(rdata) => {
+            resp.add_answer(Record::from_rdata(q.name().clone(), ttl, rdata));
+        }
+        None => {
+            let soa = SOA::new(
+                local_name("lacuna."),
+                local_name("hostmaster.lacuna."),
+                1,
+                1800,
+                900,
+                604800,
+                ttl,
+            );
+            resp.add_authority(Record::from_rdata(q.name().clone(), ttl, RData::SOA(soa)));
+        }
     }
     resp
+}
+
+/// A fixed name lacuna owns; the literals always parse.
+fn local_name(s: &str) -> Name {
+    Name::from_ascii(s).unwrap_or_else(|_| Name::root())
 }
 
 fn qtype(query: &Message) -> Option<RecordType> {
@@ -173,6 +200,34 @@ mod tests {
         let r = blocked(&q, 10);
         check_common(&q, &r, ResponseCode::NoError);
         assert!(r.answers.is_empty());
+    }
+
+    /// A NODATA carries an SOA whose TTL and minimum are the answer's TTL, through the
+    /// wire, so resolvers cache it as long as they cache a blocked address.
+    #[test]
+    fn nodata_carries_an_soa_for_negative_caching() {
+        for q in [
+            query("ads.example.", RecordType::HTTPS, false),
+            query("sonder.home.", RecordType::AAAA, false),
+        ] {
+            let r = if q.queries[0].query_type() == RecordType::HTTPS {
+                wire(&blocked(&q, 3600))
+            } else {
+                wire(&rewrite(&q, Ipv4Addr::new(192, 168, 1, 107), 3600))
+            };
+            assert!(r.answers.is_empty());
+            assert_eq!(r.authorities.len(), 1);
+            let auth = &r.authorities[0];
+            assert_eq!(auth.name, *q.queries[0].name());
+            assert_eq!(auth.ttl, 3600);
+            match &auth.data {
+                RData::SOA(soa) => assert_eq!(soa.minimum, 3600),
+                other => panic!("not an SOA: {other:?}"),
+            }
+        }
+        // An answer has no SOA.
+        let q = query("ads.example.", RecordType::A, false);
+        assert!(wire(&blocked(&q, 3600)).authorities.is_empty());
     }
 
     #[test]
