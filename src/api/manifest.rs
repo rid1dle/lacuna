@@ -1097,7 +1097,7 @@ ORDER BY 1";
 
 const FAILING_NAMES: &str = "\
 SELECT domain, count(DISTINCT client) AS devices, count(*) AS n,
-       sum(upstream IS NULL) AS no_upstream, max(time) AS last
+       sum(upstream IS NULL) AS no_upstream, max(ts) AS last_ts
 FROM queries
 WHERE ts >= max(:from, :to - 604800000) AND ts < :to
   AND rcode = 'SERVFAIL'
