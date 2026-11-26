@@ -381,9 +381,14 @@ async fn serve_dns(
             config.api.listen
         ),
     }
-    // Names are resolved off the query path: config names, then router PTR, in the background.
-    clients::Devices::new(config.store.path.clone(), config.dns.router)
-        .start(config.devices.clone());
+    // Names are resolved off the query path, in the background: config names, router PTR,
+    // and IPv6 askers named after their IPv4 device through the neighbour table.
+    clients::Devices::new(
+        config.store.path.clone(),
+        config.dns.router,
+        config.dns.neighbors.clone(),
+    )
+    .start(config.devices.clone());
     tokio::select! {
         () = server::run(pipeline, listeners, log) => Ok(()),
         stop = shutdown_signal() => {

@@ -1,5 +1,6 @@
 # lacuna: the house's ad-blocking DNS server. One container, no database server
-# (SQLite is inside the binary). Target: under 40 MB of RAM.
+# (SQLite is inside the binary), plus a tiny sidecar that copies the host's neighbour
+# table for device names. Target: under 40 MB of RAM.
 #
 # LIVE since 2026-11-25: the host publishes :53 and AdGuard is stopped.
 # For a shadow run beside another resolver, change the two port lines to 5300
@@ -29,10 +30,12 @@ services:
     volumes:
       - ./config.toml:/config/config.toml:ro
       - /srv/appdata/lacuna:/data
+      - neigh:/neigh:ro
     secrets:
       - lacuna_api
     # Host 5300 (shadow) or 53 (live) onto 5353 inside: no capability is needed to
-    # bind a high port in the container.
+    # bind a high port in the container. Both IPv4 and IPv6 arrive through a kernel
+    # rule (DNAT) that keeps the sender, because the default network has IPv6 on.
     ports:
       - "53:5353/udp"
       - "53:5353/tcp"
@@ -61,11 +64,58 @@ services:
       start_period: 10s
       start_interval: 2s
 
+  # lacuna's network cannot see the host's neighbour table, which links a device's
+  # IPv6 addresses to its IPv4 one. This reads it on the host network (unprivileged:
+  # reading needs no capability) and leaves a copy for lacuna every 30 s.
+  neigh:
+    image: alpine:3.24
+    container_name: lacuna-neigh
+    network_mode: host
+    user: "3070:3070"
+    volumes:
+      - neigh:/neigh
+    command:
+      - sh
+      - -c
+      - while :; do ip neigh show > /neigh/.next && mv /neigh/.next /neigh/neigh; sleep 30; done
+    # sh as PID 1 ignores SIGTERM; init makes a stop immediate.
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 16m
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+
 secrets:
   lacuna_api:
     file: ./secrets/lacuna_api
 
+volumes:
+  # In memory: a copy of a table the kernel already holds, rewritten every 30 s.
+  neigh:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=1m,uid=3070,gid=3070,mode=0750"
+
 networks:
+  # IPv6 on, so IPv6 lookups to the host's port 53 go through the kernel's DNAT rule and
+  # keep their sender; without it docker-proxy relays them and lacuna logs the gateway.
+  # Both subnets are pinned: config.toml names their gateways "homelab (docker)".
+  # The IPv4 one is the subnet Docker picked when the network was first made.
+  default:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 192.168.224.0/20
+          gateway: 192.168.224.1
+        - subnet: fd0c:4c7d:8a53::/64
+          gateway: fd0c:4c7d:8a53::1
   # internal: no route off the host. Only lacuna and Sonder.
   lacuna-api:
     external: true

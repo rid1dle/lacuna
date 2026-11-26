@@ -470,7 +470,7 @@ async fn reload_config<F: Fetch + 'static, U: Upstream>(rt: &Runtime<F, U>) -> (
     }
     // What `Config` holds that nothing above swaps in: read once at startup.
     message.push_str(
-        ". [upstreams], dns.listen, dns.max_inflight, dns.router and the [api] and [store] \
+        ". [upstreams], dns.listen, dns.max_inflight, dns.router, dns.neighbors and the [api] and [store] \
          sections apply at the next restart.",
     );
     (true, message)
@@ -1760,6 +1760,7 @@ mod tests {
             "dns.listen",
             "dns.max_inflight",
             "dns.router",
+            "dns.neighbors",
             "[api]",
             "[store]",
         ] {

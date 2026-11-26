@@ -39,6 +39,11 @@ pub struct DnsConfig {
     pub max_inflight: usize,
     /// The router's address, asked for the PTR names of LAN clients.
     pub router: IpAddr,
+    /// The host's neighbour table, as `ip neigh show` prints it, kept fresh by the `neigh`
+    /// sidecar (deploy/compose.yml). It names an IPv6 asker after the IPv4 device with the
+    /// same hardware address. Unset: IPv6 askers get only router PTR names.
+    #[serde(default)]
+    pub neighbors: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]

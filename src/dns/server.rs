@@ -166,7 +166,7 @@ async fn serve_udp<U: Upstream + 'static>(
         let bytes = buf[..n].to_vec();
         let (pipeline, sock, log) = (Arc::clone(&pipeline), Arc::clone(&sock), Arc::clone(&log));
         tokio::spawn(async move {
-            if let Some(reply) = respond(&pipeline, &*log, &bytes, from.ip(), true).await {
+            if let Some(reply) = respond(&pipeline, &*log, &bytes, sender(from), true).await {
                 if let Err(e) = sock.send_to(&reply, from).await {
                     debug!(%from, "udp send: {e}");
                 }
@@ -191,7 +191,7 @@ async fn serve_tcp<U: Upstream + 'static>(
                 };
                 let (pipeline, log) = (Arc::clone(&pipeline), Arc::clone(&log));
                 tokio::spawn(async move {
-                    connection(&pipeline, &*log, stream, peer.ip()).await;
+                    connection(&pipeline, &*log, stream, sender(peer)).await;
                     drop(slot);
                 });
             }
@@ -245,6 +245,13 @@ async fn connection<U: Upstream + 'static>(
     }
 }
 
+/// The asker as the log should name it. A socket bound to `[::]` also takes IPv4 and
+/// reports those senders as IPv4-mapped IPv6 (`::ffff:192.168.0.5`); `to_canonical`
+/// turns them back into `192.168.0.5`, so device names keyed by IPv4 still match.
+fn sender(addr: SocketAddr) -> IpAddr {
+    addr.ip().to_canonical()
+}
+
 /// Fills `buf` within `TCP_IDLE`; false on timeout, error or a closed connection.
 async fn read_in_time(stream: &mut TcpStream, buf: &mut [u8]) -> bool {
     matches!(
@@ -282,6 +289,10 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(3);
 
     async fn start() -> (SocketAddr, Arc<Collect>) {
+        start_on("127.0.0.1:0".parse().unwrap()).await
+    }
+
+    async fn start_on(bind: SocketAddr) -> (SocketAddr, Arc<Collect>) {
         let state = Arc::new(State::default());
         let p = Arc::new(Pipeline::new(
             rules(&[], ""),
@@ -289,9 +300,7 @@ mod tests {
             upstreams(&state, Duration::from_millis(1)),
             300,
         ));
-        let listeners = Listeners::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+        let listeners = Listeners::bind(bind).await.unwrap();
         let addr = listeners.local_addr().unwrap();
         let log = Arc::new(Collect::default());
         tokio::spawn(run(p, listeners, Arc::clone(&log) as Arc<dyn LogSink>));
@@ -384,6 +393,25 @@ mod tests {
                 "x.home.riddlelab.dev"
             ]
         );
+    }
+
+    /// Live config listens on `[::]` so IPv6 lookups keep their sender. IPv4 askers then
+    /// arrive IPv4-mapped and must still be logged as plain IPv4, over UDP and TCP.
+    #[tokio::test]
+    async fn dual_stack_listener_logs_ipv4_askers_as_ipv4() {
+        let (bound, log) = start_on("[::]:0".parse().unwrap()).await;
+        let to = SocketAddr::from((Ipv4Addr::LOCALHOST, bound.port()));
+
+        let sock = udp_client().await;
+        udp_exchange(&sock, to, &wire("home.riddlelab.dev.", 21), WAIT)
+            .await
+            .expect("udp reply over the dual-stack socket");
+        let mut s = TcpStream::connect(to).await.unwrap();
+        tcp_send(&mut s, &wire("home.riddlelab.dev.", 22)).await;
+        assert_eq!(tcp_recv(&mut s).await.metadata.id, 22);
+
+        let clients: Vec<IpAddr> = log.0.lock().unwrap().iter().map(|r| r.client).collect();
+        assert_eq!(clients, [IpAddr::V4(Ipv4Addr::LOCALHOST); 2]);
     }
 
     #[tokio::test]

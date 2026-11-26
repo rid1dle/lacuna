@@ -3,7 +3,9 @@
 user_rules = []
 
 [dns]
-listen = "0.0.0.0:5353"
+# [::] takes IPv4 and IPv6. IPv6 lookups keep their sender only because lacuna's
+# Docker network has IPv6 on (compose.yml); IPv4 askers are logged as plain IPv4.
+listen = "[::]:5353"
 refused_names = ["version.bind", "id.server", "hostname.bind"]
 # Seconds a device keeps a block. At 10, apps that retry a blocked name every
 # half minute (WhatsApp, Grammarly, Slack telemetry) asked again each time:
@@ -12,6 +14,9 @@ refused_names = ["version.bind", "id.server", "hostname.bind"]
 blocked_ttl = 3600
 max_inflight = 300
 router = "192.168.0.1"
+# Written every 30 s by the neigh sidecar (compose.yml): names IPv6 askers after the
+# IPv4 device with the same hardware address.
+neighbors = "/neigh/neigh"
 
 [upstreams]
 fallback = ["9.9.9.9:53", "1.1.1.1:53"]
@@ -50,6 +55,9 @@ a = "192.168.0.107"
 # lookups, and lacuna's own health check asks from inside its container.
 "192.168.224.1" = "homelab (docker)"
 "172.20.0.1" = "homelab (docker)"
+# The same over IPv6: the server's own IPv6 lookups reach lacuna through docker-proxy
+# and arrive from lacuna's network gateway (compose.yml).
+"fd0c:4c7d:8a53::1" = "homelab (docker)"
 "127.0.0.1" = "lacuna healthcheck"
 # Guessed from what they look up (2026-11-26); rename when known.
 "192.168.0.117" = "iPhone 3"

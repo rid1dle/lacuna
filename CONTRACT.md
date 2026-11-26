@@ -372,7 +372,7 @@ the running config (added, enabled, or moved to another URL) has no usable copy 
 those are fetched in the background, the message ends with `; refreshing N new lists`,
 and they block once the fetch is done (seconds; up to 30 s per list). If the file does
 not load or fails validation, nothing changes and the answer is `ok: false` with the
-error. `[upstreams]`, `dns.listen`, `dns.max_inflight`, `dns.router` and the `[api]` and
+error. `[upstreams]`, `dns.listen`, `dns.max_inflight`, `dns.router`, `dns.neighbors` and the `[api]` and
 `[store]` sections need a restart.
 
 `test_domain` checks the name itself in DNS order: refused names, rewrites, then the
@@ -444,7 +444,7 @@ Authorization: Bearer 7f3c9a...
 ```
 
 ```json
-{ "ok": true, "message": "config reloaded: 2 lists, 0 user rules, 2 rewrites, 0 device names. [upstreams], dns.listen, dns.max_inflight, dns.router and the [api] and [store] sections apply at the next restart." }
+{ "ok": true, "message": "config reloaded: 2 lists, 0 user rules, 2 rewrites, 0 device names. [upstreams], dns.listen, dns.max_inflight, dns.router, dns.neighbors and the [api] and [store] sections apply at the next restart." }
 ```
 
 With a broken file:
