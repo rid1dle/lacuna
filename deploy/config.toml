@@ -55,9 +55,12 @@ a = "192.168.0.107"
 # lookups, and lacuna's own health check asks from inside its container.
 "192.168.224.1" = "homelab (docker)"
 "172.20.0.1" = "homelab (docker)"
-# The same over IPv6: the server's own IPv6 lookups reach lacuna through docker-proxy
-# and arrive from lacuna's network gateway (compose.yml).
+# lacuna's network gateway over IPv6 (compose.yml), the IPv6 twin of 192.168.224.1.
 "fd0c:4c7d:8a53::1" = "homelab (docker)"
+# The server's fixed IPv6 address. Its own lookups go to lacuna at that address and
+# arrive from it (seen 2026-11-26), as its IPv4 ones arrive from 192.168.0.107. The
+# neighbour table can't name it: the server is not its own neighbour.
+"fd4a:f14c:7097::53" = "homelab"
 "127.0.0.1" = "lacuna healthcheck"
 # Guessed from what they look up (2026-11-26); rename when known.
 "192.168.0.117" = "iPhone 3"
