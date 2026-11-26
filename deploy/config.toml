@@ -5,7 +5,11 @@ user_rules = []
 [dns]
 listen = "0.0.0.0:5353"
 refused_names = ["version.bind", "id.server", "hostname.bind"]
-blocked_ttl = 10
+# Seconds a device keeps a block. At 10, apps that retry a blocked name every
+# half minute (WhatsApp, Grammarly, Slack telemetry) asked again each time:
+# 3,234 lookups a day for one name from one laptop. An unblock now reaches
+# devices within the hour.
+blocked_ttl = 3600
 max_inflight = 300
 router = "192.168.0.1"
 
@@ -42,6 +46,16 @@ name = "*.home.riddlelab.dev"
 a = "192.168.0.107"
 
 [devices]
+# This server, seen three ways: Docker network gateways carry the containers'
+# lookups, and lacuna's own health check asks from inside its container.
+"192.168.224.1" = "homelab (docker)"
+"172.20.0.1" = "homelab (docker)"
+"127.0.0.1" = "lacuna healthcheck"
+# Guessed from what they look up (2026-11-26); rename when known.
+"192.168.0.117" = "iPhone 3"
+"192.168.0.145" = "Echo"
+"192.168.0.171" = "Mac 3"
+"192.168.0.180" = "Amazon laptop 2"
 
 [api]
 listen = "0.0.0.0:8053"
